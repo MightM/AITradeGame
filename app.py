@@ -564,14 +564,14 @@ if __name__ == '__main__':
     
     print("\n" + "=" * 60)
     print("AITradeGame is running!")
-    print("Server: http://localhost:5000")
+    print("Server: http://localhost:5002")
     print("Press Ctrl+C to stop")
     print("=" * 60 + "\n")
     
     # 自动打开浏览器
     def open_browser():
         time.sleep(1.5)  # 等待服务器启动
-        url = "http://localhost:5000"
+        url = "http://localhost:5002"
         try:
             webbrowser.open(url)
             print(f"[INFO] Browser opened: {url}")
@@ -581,4 +581,4 @@ if __name__ == '__main__':
     browser_thread = threading.Thread(target=open_browser, daemon=True)
     browser_thread.start()
     
-    app.run(debug=False, host='0.0.0.0', port=5000, use_reloader=False)
+    app.run(debug=False, host='0.0.0.0', port=5002, use_reloader=False)
