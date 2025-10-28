@@ -10,7 +10,7 @@ AITradeGame is a Flask-based trading simulator that mixes API-driven back-end lo
 
 ## Build, Test, and Development Commands
 - Set up dependencies: `python -m venv .venv && source .venv/bin/activate && pip install -r requirements.txt`.
-- Run the app locally: `python app.py` (serves http://localhost:5000).
+- Run the app locally: `python app.py` (serves http://localhost:5002).
 - Docker workflow: `docker-compose up -d` to start, `docker-compose down` to stop and release the bound volume.
 - Create a distributable binary: `pyinstaller app.py --name AITradeGame` (mirrors the existing release build pipeline).
 
