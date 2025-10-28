@@ -1,8 +1,21 @@
+"""
+TradingEngine 模块：封装“单个模型（账户）的一次交易周期”的业务流程。
+
+职责概览：
+- 拉取市场状态（价格 + 技术指标）
+- 查询当前账户（组合、现金、权益变化）
+- 调用 AITrader 生成交易决策
+- 执行决策并记录成交，保存账户价值快照
+
+说明：这里只做本地回测式撮合，不与真实交易所交互。
+"""
+
 from datetime import datetime
 from typing import Dict
 import json
 
 class TradingEngine:
+    """面向某个模型（model_id）的交易执行引擎。"""
     def __init__(self, model_id: int, db, market_fetcher, ai_trader, trade_fee_rate: float = 0.001):
         self.model_id = model_id
         self.db = db
@@ -12,6 +25,7 @@ class TradingEngine:
         self.trade_fee_rate = trade_fee_rate  # 从配置中传入费率
     
     def execute_trading_cycle(self) -> Dict:
+        # 一次完整交易循环：拉行情 → 取组合 → 让 AI 决策 → 执行 → 记账
         try:
             market_state = self._get_market_state()
             
@@ -25,6 +39,7 @@ class TradingEngine:
                 market_state, portfolio, account_info
             )
             
+            # 记录一条“对话”，便于追踪 AI 的决策依据
             self.db.add_conversation(
                 self.model_id,
                 user_prompt=self._format_prompt(market_state, portfolio, account_info),
@@ -32,8 +47,10 @@ class TradingEngine:
                 cot_trace=''
             )
             
+            # 根据 AI 的决定执行模拟交易
             execution_results = self._execute_decisions(decisions, market_state, portfolio)
             
+            # 执行后重新计算并记录账户价值（用于曲线展示）
             updated_portfolio = self.db.get_portfolio(self.model_id, current_prices)
             self.db.record_account_value(
                 self.model_id,
@@ -59,6 +76,7 @@ class TradingEngine:
             }
     
     def _get_market_state(self) -> Dict:
+        # 聚合价格与技术指标，形成给 AI 使用的结构化市场信息
         market_state = {}
         prices = self.market_fetcher.get_current_prices(self.coins)
         
@@ -71,6 +89,7 @@ class TradingEngine:
         return market_state
     
     def _build_account_info(self, portfolio: Dict) -> Dict:
+        # 从数据库取模型的初始资金，并基于当前组合计算收益率
         model = self.db.get_model(self.model_id)
         initial_capital = model['initial_capital']
         total_value = portfolio['total_value']
@@ -88,6 +107,7 @@ class TradingEngine:
     
     def _execute_decisions(self, decisions: Dict, market_state: Dict, 
                           portfolio: Dict) -> list:
+        # 逐个币种按信号执行：buy_to_enter/sell_to_enter/close_position/hold
         results = []
         
         for coin, decision in decisions.items():
@@ -117,12 +137,16 @@ class TradingEngine:
     
     def _execute_buy(self, coin: str, decision: Dict, market_state: Dict, 
                     portfolio: Dict) -> Dict:
+        # 做多开仓（Long）：校验数量、计算保证金与费用，更新仓位/成交
         quantity = float(decision.get('quantity', 0))
         leverage = int(decision.get('leverage', 1))
         price = market_state[coin]['price']
         
         if quantity <= 0:
             return {'coin': coin, 'error': 'Invalid quantity'}
+
+        # 说明：trade_amount=名义交易额；trade_fee=手续费；required_margin=所需保证金
+        # 总需现金 = required_margin + trade_fee（下单前需有足够现金）
         
         # 计算交易额和交易费（按交易额的比例）
         trade_amount = quantity * price  # 交易额
@@ -157,6 +181,7 @@ class TradingEngine:
     
     def _execute_sell(self, coin: str, decision: Dict, market_state: Dict, 
                  portfolio: Dict) -> Dict:
+        # 做空开仓（Short）：与做多类似，按名义额计算费用与保证金
         quantity = float(decision.get('quantity', 0))
         leverage = int(decision.get('leverage', 1))
         price = market_state[coin]['price']

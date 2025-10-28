@@ -1,3 +1,15 @@
+"""
+AITradeGame 的 Flask 应用入口。
+
+职责概览：
+- 创建 Flask 应用、开启 CORS，连接前端。
+- 初始化数据库、行情拉取器与交易引擎池等全局对象。
+- 暴露管理模型/交易/资产/设置/版本等一系列 REST API。
+- 在程序启动时开启后台线程，按固定频率执行自动交易循环。
+
+阅读顺序建议：先看全局对象，再看各 @app.route 路由，最后看 main 启动流程。
+"""
+
 from flask import Flask, render_template, request, jsonify
 from flask_cors import CORS
 import time
@@ -14,17 +26,21 @@ from version import __version__, __github_owner__, __repo__, GITHUB_REPO_URL, LA
 app = Flask(__name__)
 CORS(app)
 
-db = Database('AITradeGame.db')
-market_fetcher = MarketDataFetcher()
-trading_engines = {}
-auto_trading = True
-TRADE_FEE_RATE = 0.001  # 默认交易费率
+# 全局单例对象：在进程内共享，避免重复创建
+db = Database('AITradeGame.db')          # SQLite 数据库（账户/交易/对话/配置等）
+market_fetcher = MarketDataFetcher()     # 行情获取（当前只拉常见币种的现价）
+trading_engines = {}                     # 交易引擎池：{model_id: TradingEngine}
+auto_trading = True                      # 是否启用后台自动交易循环
+trading_engines = {}                     # 交易引擎池：{model_id: TradingEngine}
+TRADE_FEE_RATE = 0.001  # 默认交易费率（千分之一），撮合时会扣除
 
 @app.route('/')
 def index():
+    # 返回前端单页（static/app.js 会调用下方 /api/* 接口获取数据）
     return render_template('index.html')
 
 # ============ Provider API Endpoints ============
+# 服务商管理：增/删/查，以及（尝试）从服务商 API 获取模型列表
 
 @app.route('/api/providers', methods=['GET'])
 def get_providers():
@@ -104,6 +120,7 @@ def fetch_provider_models():
         return jsonify({'error': f'Failed to fetch models: {str(e)}'}), 500
 
 # ============ Model API Endpoints ============
+# 模型 = 一个具体的交易体实例（绑定服务商与模型名称，带初始资金）
 
 @app.route('/api/models', methods=['GET'])
 def get_models():
@@ -112,6 +129,7 @@ def get_models():
 
 @app.route('/api/models', methods=['POST'])
 def add_model():
+    # 新增一个模型，并为其在内存中创建 TradingEngine 实例
     data = request.json
     try:
         # Get provider info
@@ -126,6 +144,7 @@ def add_model():
             initial_capital=float(data.get('initial_capital', 100000))
         )
 
+        # 取回刚创建的模型配置，用于初始化交易引擎依赖
         model = db.get_model(model_id)
         trading_engines[model_id] = TradingEngine(
             model_id=model_id,
@@ -148,6 +167,7 @@ def add_model():
 
 @app.route('/api/models/<int:model_id>', methods=['DELETE'])
 def delete_model(model_id):
+    # 删除数据库中的模型，并清理内存中的交易引擎
     try:
         model = db.get_model(model_id)
         model_name = model['name'] if model else f"ID-{model_id}"
@@ -164,6 +184,7 @@ def delete_model(model_id):
 
 @app.route('/api/models/<int:model_id>/portfolio', methods=['GET'])
 def get_portfolio(model_id):
+    # 返回该模型的资产快照（现金、持仓、账户价值历史）
     prices_data = market_fetcher.get_current_prices(['BTC', 'ETH', 'SOL', 'BNB', 'XRP', 'DOGE'])
     current_prices = {coin: prices_data[coin]['price'] for coin in prices_data}
     
@@ -177,23 +198,25 @@ def get_portfolio(model_id):
 
 @app.route('/api/models/<int:model_id>/trades', methods=['GET'])
 def get_trades(model_id):
+    # 返回该模型的成交列表（可通过 ?limit= 指定条数）
     limit = request.args.get('limit', 50, type=int)
     trades = db.get_trades(model_id, limit=limit)
     return jsonify(trades)
 
 @app.route('/api/models/<int:model_id>/conversations', methods=['GET'])
 def get_conversations(model_id):
+    # 返回该模型与 AI 的对话记录，便于理解策略决策过程
     limit = request.args.get('limit', 20, type=int)
     conversations = db.get_conversations(model_id, limit=limit)
     return jsonify(conversations)
 
 @app.route('/api/aggregated/portfolio', methods=['GET'])
 def get_aggregated_portfolio():
-    """Get aggregated portfolio data across all models"""
+    """汇总所有模型的资产与持仓，提供整体视图给前端。"""
     prices_data = market_fetcher.get_current_prices(['BTC', 'ETH', 'SOL', 'BNB', 'XRP', 'DOGE'])
     current_prices = {coin: prices_data[coin]['price'] for coin in prices_data}
 
-    # Get aggregated data
+    # 累加每个模型的资产数据
     models = db.get_all_models()
     total_portfolio = {
         'total_value': 0,
@@ -217,7 +240,7 @@ def get_aggregated_portfolio():
             total_portfolio['unrealized_pnl'] += portfolio.get('unrealized_pnl', 0)
             total_portfolio['initial_capital'] += portfolio.get('initial_capital', 0)
 
-            # Aggregate positions by coin and side
+            # 按“币种+方向（多/空）”合并持仓，计算加权均价
             for pos in portfolio.get('positions', []):
                 key = f"{pos['coin']}_{pos['side']}"
                 if key not in all_positions:
@@ -232,7 +255,7 @@ def get_aggregated_portfolio():
                         'pnl': 0
                     }
 
-                # Weighted average calculation
+                # 加权平均成本计算（把多笔同向仓位合并）
                 current_pos = all_positions[key]
                 current_cost = current_pos['quantity'] * current_pos['avg_price']
                 new_cost = pos['quantity'] * pos['avg_price']
@@ -246,7 +269,7 @@ def get_aggregated_portfolio():
 
     total_portfolio['positions'] = list(all_positions.values())
 
-    # Get multi-model chart data
+    # 多模型账户价值曲线（供前端绘制对比图）
     chart_data = db.get_multi_model_chart_data(limit=100)
 
     return jsonify({
@@ -270,6 +293,7 @@ def get_market_prices():
 
 @app.route('/api/models/<int:model_id>/execute', methods=['POST'])
 def execute_trading(model_id):
+    # 手动触发指定模型执行一次完整“交易循环”（拉行情→AI 给信号→下单记录）
     if model_id not in trading_engines:
         model = db.get_model(model_id)
         if not model:
@@ -299,6 +323,7 @@ def execute_trading(model_id):
         return jsonify({'error': str(e)}), 500
 
 def trading_loop():
+    # 后台自动交易循环：定时对所有模型执行一次交易周期，并打印简单日志
     print("[INFO] Trading loop started")
     
     while auto_trading:
@@ -353,6 +378,7 @@ def trading_loop():
 
 @app.route('/api/leaderboard', methods=['GET'])
 def get_leaderboard():
+    # 简单的收益排行榜：按收益率（账户价值/初始资金 - 1）排序
     models = db.get_all_models()
     leaderboard = []
     
@@ -377,7 +403,7 @@ def get_leaderboard():
 
 @app.route('/api/settings', methods=['GET'])
 def get_settings():
-    """Get system settings"""
+    """读取系统设置（如交易频率、手续费率等）。"""
     try:
         settings = db.get_settings()
         return jsonify(settings)
@@ -386,7 +412,7 @@ def get_settings():
 
 @app.route('/api/settings', methods=['PUT'])
 def update_settings():
-    """Update system settings"""
+    """更新系统设置（当前支持：交易频率分钟数、手续费率）。"""
     try:
         data = request.json
         trading_frequency_minutes = int(data.get('trading_frequency_minutes', 60))
@@ -403,7 +429,7 @@ def update_settings():
 
 @app.route('/api/version', methods=['GET'])
 def get_version():
-    """Get current version information"""
+    """返回当前版本信息、仓库链接与最新发布页地址（版本号来自 version.py）。"""
     return jsonify({
         'current_version': __version__,
         'github_repo': GITHUB_REPO_URL,
@@ -412,7 +438,7 @@ def get_version():
 
 @app.route('/api/check-update', methods=['GET'])
 def check_update():
-    """Check for GitHub updates"""
+    """调用 GitHub API（releases/latest）检查是否存在新版本。"""
     try:
         import requests
 
@@ -471,28 +497,25 @@ def check_update():
         }), 500
 
 def compare_versions(version1, version2):
-    """Compare two version strings.
+    """比较两个版本号字符串大小。
 
-    Returns:
-        1 if version1 > version2
-        0 if version1 == version2
-        -1 if version1 < version2
+    返回：1 表示 v1>v2；0 表示相等；-1 表示 v1<v2
     """
     def normalize(v):
-        # Extract numeric parts from version string
+        # 仅提取数字段（忽略 v 等前缀），得到 [major, minor, patch, ...]
         parts = re.findall(r'\d+', v)
-        # Pad with zeros to make them comparable
+        # 后续会补零对齐，方便逐位比较
         return [int(p) for p in parts]
 
     v1_parts = normalize(version1)
     v2_parts = normalize(version2)
 
-    # Pad shorter version with zeros
+    # 短者补零对齐到同等长度
     max_len = max(len(v1_parts), len(v2_parts))
     v1_parts.extend([0] * (max_len - len(v1_parts)))
     v2_parts.extend([0] * (max_len - len(v2_parts)))
 
-    # Compare
+    # 逐位比较
     if v1_parts > v2_parts:
         return 1
     elif v1_parts < v2_parts:
@@ -501,6 +524,7 @@ def compare_versions(version1, version2):
         return 0
 
 def init_trading_engines():
+    # 程序启动时：为数据库中已有的模型全部创建对应的 TradingEngine
     try:
         models = db.get_all_models()
 
@@ -550,6 +574,7 @@ if __name__ == '__main__':
     print("=" * 60)
     print("[INFO] Initializing database...")
     
+    # 初始化/迁移数据库（首次运行会建表，后续可能执行版本迁移）
     db.init_db()
     
     print("[INFO] Database initialized")
@@ -557,6 +582,7 @@ if __name__ == '__main__':
     
     init_trading_engines()
     
+    # 若开启自动交易，则启动后台线程持续运行交易循环
     if auto_trading:
         trading_thread = threading.Thread(target=trading_loop, daemon=True)
         trading_thread.start()
@@ -569,6 +595,7 @@ if __name__ == '__main__':
     print("=" * 60 + "\n")
     
     # 自动打开浏览器
+    # 在本机自动打开浏览器访问首页（可选）
     def open_browser():
         time.sleep(1.5)  # 等待服务器启动
         url = "http://localhost:5002"

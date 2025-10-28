@@ -10,13 +10,24 @@ class AITrader:
     
     def make_decision(self, market_state: Dict, portfolio: Dict, 
                      account_info: Dict) -> Dict:
+        """调用大模型，并将输出解析为交易决策字典。
+
+        若解析失败，返回包含原始输出的结构，方便前端/数据库查看：
+        {"_raw_response": "..."}
+        """
         prompt = self._build_prompt(market_state, portfolio, account_info)
-        
+
         response = self._call_llm(prompt)
-        
+
         decisions = self._parse_response(response)
-        
-        return decisions
+
+        # 始终附带原始输出，便于 UI/排查（不会影响交易执行逻辑，因 key 非币种名）
+        merged = {}
+        if isinstance(decisions, dict):
+            merged.update(decisions)
+        if response:
+            merged["_raw_response"] = response
+        return merged
     
     def _build_prompt(self, market_state: Dict, portfolio: Dict, 
                      account_info: Dict) -> str:
@@ -129,17 +140,49 @@ Analyze and output JSON only.
             raise Exception(error_msg)
     
     def _parse_response(self, response: str) -> Dict:
-        response = response.strip()
-        
-        if '```json' in response:
-            response = response.split('```json')[1].split('```')[0]
-        elif '```' in response:
-            response = response.split('```')[1].split('```')[0]
-        
-        try:
-            decisions = json.loads(response.strip())
-            return decisions
-        except json.JSONDecodeError as e:
-            print(f"[ERROR] JSON parse failed: {e}")
-            print(f"[DATA] Response:\n{response}")
+        """尽量鲁棒地从模型回复中提取 JSON 对象。
+
+        处理要点：
+        - 去除 Markdown 代码块（```json/```）
+        - 截取第一个花括号到最后一个花括号的内容
+        - 多次尝试解析，失败则返回空 dict，由调用方兜底
+        """
+        if not response:
             return {}
+
+        text = response.strip()
+
+        # 1) 去掉 markdown 代码块包裹
+        if '```json' in text:
+            try:
+                text = text.split('```json', 1)[1].split('```', 1)[0]
+            except Exception:
+                pass
+        elif '```' in text:
+            try:
+                text = text.split('```', 1)[1].split('```', 1)[0]
+            except Exception:
+                pass
+
+        text = text.strip()
+
+        # 2) 直接尝试解析
+        try:
+            return json.loads(text)
+        except Exception:
+            pass
+
+        # 3) 宽松提取：取第一个 { 到最后一个 } 之间的内容再解析
+        l = text.find('{')
+        r = text.rfind('}')
+        if 0 <= l < r:
+            candidate = text[l:r+1]
+            try:
+                return json.loads(candidate)
+            except Exception:
+                # 保留日志便于服务器侧排查
+                print("[WARN] Fuzzy JSON parse failed. Candidate snippet shown below:")
+                print(candidate)
+                return {}
+        
+        return {}

@@ -1,18 +1,24 @@
 """
 Market data module - Binance API integration
+
+中文说明：
+- 主要从 Binance 批量获取常见币种的当前价格与 24h 涨跌幅；
+- 当 Binance 不可达时，回退到 CoinGecko；
+- 使用简单内存缓存（默认 5 秒）以减少请求频率；
+- 还提供历史价格与简单技术指标（SMA/RSI）供策略参考。
 """
 import requests
 import time
 from typing import Dict, List
 
 class MarketDataFetcher:
-    """Fetch real-time market data from Binance API"""
+    """封装行情获取逻辑（首选 Binance，失败回退 CoinGecko）。"""
     
     def __init__(self):
         self.binance_base_url = "https://api.binance.com/api/v3"
         self.coingecko_base_url = "https://api.coingecko.com/api/v3"
         
-        # Binance symbol mapping
+        # Binance 交易对映射（以 USDT 为报价货币）
         self.binance_symbols = {
             'BTC': 'BTCUSDT',
             'ETH': 'ETHUSDT',
@@ -22,7 +28,7 @@ class MarketDataFetcher:
             'DOGE': 'DOGEUSDT'
         }
         
-        # CoinGecko mapping for technical indicators
+        # CoinGecko 的币种 ID 映射（用于历史/指标查询）
         self.coingecko_mapping = {
             'BTC': 'bitcoin',
             'ETH': 'ethereum',
@@ -32,13 +38,14 @@ class MarketDataFetcher:
             'DOGE': 'dogecoin'
         }
         
+        # 简单内存缓存：按请求组合缓存 5 秒，降低 API 调用频次
         self._cache = {}
         self._cache_time = {}
-        self._cache_duration = 5  # Cache for 5 seconds
+        self._cache_duration = 5  # 缓存秒数
     
     def get_current_prices(self, coins: List[str]) -> Dict[str, float]:
-        """Get current prices from Binance API"""
-        # Check cache
+        """从 Binance 批量获取当前价格与 24h 涨跌，必要时回退 CoinGecko。"""
+        # 命中缓存则直接返回
         cache_key = 'prices_' + '_'.join(sorted(coins))
         if cache_key in self._cache:
             if time.time() - self._cache_time[cache_key] < self._cache_duration:
@@ -47,11 +54,11 @@ class MarketDataFetcher:
         prices = {}
         
         try:
-            # Batch fetch Binance 24h ticker data
+            # 批量获取 Binance 24h ticker 数据
             symbols = [self.binance_symbols.get(coin) for coin in coins if coin in self.binance_symbols]
             
             if symbols:
-                # Build symbols parameter
+                # 构造批量 symbols 参数（Binance 支持）
                 symbols_param = '[' + ','.join([f'"{s}"' for s in symbols]) + ']'
                 
                 response = requests.get(
@@ -62,7 +69,7 @@ class MarketDataFetcher:
                 response.raise_for_status()
                 data = response.json()
                 
-                # Parse data
+                # 解析并映射回通用币种代码
                 for item in data:
                     symbol = item['symbol']
                     # Find corresponding coin
@@ -74,7 +81,7 @@ class MarketDataFetcher:
                             }
                             break
             
-            # Update cache
+            # 更新缓存
             self._cache[cache_key] = prices
             self._cache_time[cache_key] = time.time()
             
@@ -82,11 +89,11 @@ class MarketDataFetcher:
             
         except Exception as e:
             print(f"[ERROR] Binance API failed: {e}")
-            # Fallback to CoinGecko
+            # 回退到 CoinGecko 获取基础价格
             return self._get_prices_from_coingecko(coins)
     
     def _get_prices_from_coingecko(self, coins: List[str]) -> Dict[str, float]:
-        """Fallback: Fetch prices from CoinGecko"""
+        """回退：从 CoinGecko 获取价格与 24h 涨跌。"""
         try:
             coin_ids = [self.coingecko_mapping.get(coin, coin.lower()) for coin in coins]
             
@@ -117,7 +124,7 @@ class MarketDataFetcher:
             return {coin: {'price': 0, 'change_24h': 0} for coin in coins}
     
     def get_market_data(self, coin: str) -> Dict:
-        """Get detailed market data from CoinGecko"""
+        """从 CoinGecko 获取更详细的市场数据（市值、成交额、高低点等）。"""
         coin_id = self.coingecko_mapping.get(coin, coin.lower())
         
         try:
@@ -145,7 +152,7 @@ class MarketDataFetcher:
             return {}
     
     def get_historical_prices(self, coin: str, days: int = 7) -> List[Dict]:
-        """Get historical prices from CoinGecko"""
+        """从 CoinGecko 获取近 N 天（默认 7 天）的历史价格序列。"""
         coin_id = self.coingecko_mapping.get(coin, coin.lower())
         
         try:
@@ -170,7 +177,7 @@ class MarketDataFetcher:
             return []
     
     def calculate_technical_indicators(self, coin: str) -> Dict:
-        """Calculate technical indicators"""
+        """基于简单历史价格计算基础技术指标（SMA/RSI 等）。"""
         historical = self.get_historical_prices(coin, days=14)
         
         if not historical or len(historical) < 14:
@@ -178,11 +185,11 @@ class MarketDataFetcher:
         
         prices = [p['price'] for p in historical]
         
-        # Simple Moving Average
+        # 简单移动平均（SMA）
         sma_7 = sum(prices[-7:]) / 7 if len(prices) >= 7 else prices[-1]
         sma_14 = sum(prices[-14:]) / 14 if len(prices) >= 14 else prices[-1]
         
-        # Simple RSI calculation
+        # 简化版 RSI 计算（以 14 为周期）
         changes = [prices[i] - prices[i-1] for i in range(1, len(prices))]
         gains = [c if c > 0 else 0 for c in changes]
         losses = [-c if c < 0 else 0 for c in changes]

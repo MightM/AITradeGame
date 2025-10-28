@@ -1,5 +1,9 @@
 """
 Database management module
+
+中文说明：
+- 使用 SQLite 持久化服务商、模型、持仓、成交、对话与账户价值历史。
+- 提供增删改查与聚合查询，供后端 API 与交易引擎调用。
 """
 import sqlite3
 import json
@@ -18,6 +22,14 @@ class Database:
     
     def init_db(self):
         """Initialize database tables"""
+        # 数据表概览：
+        # - providers: 服务商（名称/API/Key/模型）
+        # - models: 模型/账户（服务商+模型名+初始资金）
+        # - portfolios: 当前持仓（唯一键：model_id+coin+side）
+        # - trades: 成交记录（fee 手续费，pnl 盈亏）
+        # - conversations: 对话记录与推理链
+        # - account_values: 账户价值快照（绘图）
+        # - settings: 系统设置（频率、费率）
         conn = self.get_connection()
         cursor = conn.cursor()
 
@@ -146,7 +158,11 @@ class Database:
     
     def update_position(self, model_id: int, coin: str, quantity: float, 
                        avg_price: float, leverage: int = 1, side: str = 'long'):
-        """Update position"""
+        """Update position
+
+        说明：使用 SQLite 的 UNIQUE + ON CONFLICT 语法将 INSERT/UPDATE 合并为 upsert。
+        按 model_id+coin+side 唯一，写入最新数量、均价与杠杆。
+        """
         conn = self.get_connection()
         cursor = conn.cursor()
         cursor.execute('''
@@ -163,10 +179,14 @@ class Database:
     
     def get_portfolio(self, model_id: int, current_prices: Dict = None) -> Dict:
         """Get portfolio with positions and P&L
-        
+
+        中文说明：
+        - 返回持仓明细、现金、名义持仓价值、使用保证金、已实现/未实现盈亏、总账户价值；
+        - 若提供 current_prices，将计算未实现盈亏并附加到每条持仓。
+
         Args:
             model_id: Model ID
-            current_prices: Current market prices {coin: price} for unrealized P&L calculation
+            current_prices: 当前价格 {coin: price}，用于计算未实现盈亏
         """
         conn = self.get_connection()
         cursor = conn.cursor()
@@ -220,12 +240,15 @@ class Database:
                 pos['pnl'] = 0
         
         # Cash = initial capital + realized P&L - margin used
+        # 中文：现金 = 初始资金 + 已实现盈亏 - 使用保证金（保证金视为占用现金）
         cash = initial_capital + realized_pnl - margin_used
         
         # Position value = quantity * entry price (not margin!)
+        # 中文：名义持仓价值 = 数量 * 开仓均价（这里非保证金金额）
         positions_value = sum([p['quantity'] * p['avg_price'] for p in positions])
         
         # Total account value = initial capital + realized P&L + unrealized P&L
+        # 中文：账户总价值 = 初始资金 + 已实现盈亏 + 未实现盈亏
         total_value = initial_capital + realized_pnl + unrealized_pnl
         
         conn.close()
@@ -265,6 +288,7 @@ class Database:
         conn.commit()
         conn.close()
     
+    # 成交历史查询（按时间倒序，限制条数）
     def get_trades(self, model_id: int, limit: int = 50) -> List[Dict]:
         """Get trade history"""
         conn = self.get_connection()
@@ -279,6 +303,7 @@ class Database:
     
     # ============ Conversation History ============
     
+    # 新增对话（存提示/回复/推理链）
     def add_conversation(self, model_id: int, user_prompt: str, 
                         ai_response: str, cot_trace: str = ''):
         """Add conversation record"""
@@ -291,6 +316,7 @@ class Database:
         conn.commit()
         conn.close()
     
+    # 对话历史查询
     def get_conversations(self, model_id: int, limit: int = 20) -> List[Dict]:
         """Get conversation history"""
         conn = self.get_connection()
@@ -305,6 +331,7 @@ class Database:
     
     # ============ Account Value History ============
     
+    # 记录账户价值快照（用于绘图统计）
     def record_account_value(self, model_id: int, total_value: float, 
                             cash: float, positions_value: float):
         """Record account value snapshot"""
@@ -317,6 +344,7 @@ class Database:
         conn.commit()
         conn.close()
     
+    # 某模型净值曲线（账户价值历史）
     def get_account_value_history(self, model_id: int, limit: int = 100) -> List[Dict]:
         """Get account value history"""
         conn = self.get_connection()
@@ -329,6 +357,7 @@ class Database:
         conn.close()
         return [dict(row) for row in rows]
 
+    # 所有模型聚合净值曲线（整体视图）
     def get_aggregated_account_value_history(self, limit: int = 100) -> List[Dict]:
         """Get aggregated account value history across all models"""
         conn = self.get_connection()
@@ -371,6 +400,7 @@ class Database:
 
         return result
 
+    # 多模型折线图数据（每模型各取最近 N 条）
     def get_multi_model_chart_data(self, limit: int = 100) -> List[Dict]:
         """Get chart data for all models to display in multi-line chart"""
         conn = self.get_connection()
@@ -415,6 +445,7 @@ class Database:
 
     # ============ Settings Management ============
 
+    # 读取系统设置
     def get_settings(self) -> Dict:
         """Get system settings"""
         conn = self.get_connection()
@@ -442,6 +473,7 @@ class Database:
                 'trading_fee_rate': 0.001
             }
 
+    # 更新系统设置
     def update_settings(self, trading_frequency_minutes: int, trading_fee_rate: float) -> bool:
         """Update system settings"""
         conn = self.get_connection()
@@ -468,6 +500,7 @@ class Database:
 
     # ============ Provider Management ============
 
+    # 新增服务商
     def add_provider(self, name: str, api_url: str, api_key: str, models: str = '') -> int:
         """Add new API provider"""
         conn = self.get_connection()
@@ -481,6 +514,7 @@ class Database:
         conn.close()
         return provider_id
 
+    # 查询单个服务商
     def get_provider(self, provider_id: int) -> Optional[Dict]:
         """Get provider information"""
         conn = self.get_connection()
@@ -490,6 +524,7 @@ class Database:
         conn.close()
         return dict(row) if row else None
 
+    # 查询全部服务商
     def get_all_providers(self) -> List[Dict]:
         """Get all API providers"""
         conn = self.get_connection()
@@ -499,6 +534,7 @@ class Database:
         conn.close()
         return [dict(row) for row in rows]
 
+    # 删除服务商
     def delete_provider(self, provider_id: int):
         """Delete provider"""
         conn = self.get_connection()
@@ -507,6 +543,7 @@ class Database:
         conn.commit()
         conn.close()
 
+    # 更新服务商
     def update_provider(self, provider_id: int, name: str, api_url: str, api_key: str, models: str):
         """Update provider information"""
         conn = self.get_connection()
@@ -521,6 +558,7 @@ class Database:
 
     # ============ Model Management (Updated) ============
 
+    # 新增模型（账户）
     def add_model(self, name: str, provider_id: int, model_name: str, initial_capital: float = 10000) -> int:
         """Add new trading model"""
         conn = self.get_connection()
@@ -534,6 +572,7 @@ class Database:
         conn.close()
         return model_id
 
+    # 查询模型详情（含联表的 provider api_url/api_key）
     def get_model(self, model_id: int) -> Optional[Dict]:
         """Get model information"""
         conn = self.get_connection()
@@ -548,6 +587,7 @@ class Database:
         conn.close()
         return dict(row) if row else None
 
+    # 查询全部模型列表（含服务商名称）
     def get_all_models(self) -> List[Dict]:
         """Get all trading models"""
         conn = self.get_connection()
