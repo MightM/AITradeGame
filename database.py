@@ -1,9 +1,9 @@
-"""
+﻿"""
 Database management module
 
-中文说明：
-- 使用 SQLite 持久化服务商、模型、持仓、成交、对话与账户价值历史。
-- 提供增删改查与聚合查询，供后端 API 与交易引擎调用。
+涓枃璇存槑锛?
+- 浣跨敤 SQLite 鎸佷箙鍖栨湇鍔″晢銆佹ā鍨嬨€佹寔浠撱€佹垚浜ゃ€佸璇濅笌璐︽埛浠峰€煎巻鍙层€?
+- 鎻愪緵澧炲垹鏀规煡涓庤仛鍚堟煡璇紝渚涘悗绔?API 涓庝氦鏄撳紩鎿庤皟鐢ㄣ€?
 """
 import sqlite3
 import json
@@ -22,18 +22,18 @@ class Database:
     
     def init_db(self):
         """Initialize database tables"""
-        # 数据表概览：
-        # - providers: 服务商（名称/API/Key/模型）
-        # - models: 模型/账户（服务商+模型名+初始资金）
-        # - portfolios: 当前持仓（唯一键：model_id+coin+side）
-        # - trades: 成交记录（fee 手续费，pnl 盈亏）
-        # - conversations: 对话记录与推理链
-        # - account_values: 账户价值快照（绘图）
-        # - settings: 系统设置（频率、费率）
+        # 鏁版嵁琛ㄦ瑙堬細
+        # - providers: 鏈嶅姟鍟嗭紙鍚嶇О/API/Key/妯″瀷锛?
+        # - models: 妯″瀷/璐︽埛锛堟湇鍔″晢+妯″瀷鍚?鍒濆璧勯噾锛?
+        # - portfolios: 褰撳墠鎸佷粨锛堝敮涓€閿細model_id+coin+side锛?
+        # - trades: 鎴愪氦璁板綍锛坒ee 鎵嬬画璐癸紝pnl 鐩堜簭锛?
+        # - conversations: 瀵硅瘽璁板綍涓庢帹鐞嗛摼
+        # - account_values: 璐︽埛浠峰€煎揩鐓э紙缁樺浘锛?
+        # - settings: 绯荤粺璁剧疆锛堥鐜囥€佽垂鐜囷級
         conn = self.get_connection()
         cursor = conn.cursor()
 
-        # Providers table (API提供方)
+        # Providers table (API鎻愪緵鏂?
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS providers (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -160,8 +160,8 @@ class Database:
                        avg_price: float, leverage: int = 1, side: str = 'long'):
         """Update position
 
-        说明：使用 SQLite 的 UNIQUE + ON CONFLICT 语法将 INSERT/UPDATE 合并为 upsert。
-        按 model_id+coin+side 唯一，写入最新数量、均价与杠杆。
+        璇存槑锛氫娇鐢?SQLite 鐨?UNIQUE + ON CONFLICT 璇硶灏?INSERT/UPDATE 鍚堝苟涓?upsert銆?
+        鎸?model_id+coin+side 鍞竴锛屽啓鍏ユ渶鏂版暟閲忋€佸潎浠蜂笌鏉犳潌銆?
         """
         conn = self.get_connection()
         cursor = conn.cursor()
@@ -180,13 +180,13 @@ class Database:
     def get_portfolio(self, model_id: int, current_prices: Dict = None) -> Dict:
         """Get portfolio with positions and P&L
 
-        中文说明：
-        - 返回持仓明细、现金、名义持仓价值、使用保证金、已实现/未实现盈亏、总账户价值；
-        - 若提供 current_prices，将计算未实现盈亏并附加到每条持仓。
+        涓枃璇存槑锛?
+        - 杩斿洖鎸佷粨鏄庣粏銆佺幇閲戙€佸悕涔夋寔浠撲环鍊笺€佷娇鐢ㄤ繚璇侀噾銆佸凡瀹炵幇/鏈疄鐜扮泩浜忋€佹€昏处鎴蜂环鍊硷紱
+        - 鑻ユ彁渚?current_prices锛屽皢璁＄畻鏈疄鐜扮泩浜忓苟闄勫姞鍒版瘡鏉℃寔浠撱€?
 
         Args:
             model_id: Model ID
-            current_prices: 当前价格 {coin: price}，用于计算未实现盈亏
+            current_prices: 褰撳墠浠锋牸 {coin: price}锛岀敤浜庤绠楁湭瀹炵幇鐩堜簭
         """
         conn = self.get_connection()
         cursor = conn.cursor()
@@ -240,15 +240,15 @@ class Database:
                 pos['pnl'] = 0
         
         # Cash = initial capital + realized P&L - margin used
-        # 中文：现金 = 初始资金 + 已实现盈亏 - 使用保证金（保证金视为占用现金）
+        # 涓枃锛氱幇閲?= 鍒濆璧勯噾 + 宸插疄鐜扮泩浜?- 浣跨敤淇濊瘉閲戯紙淇濊瘉閲戣涓哄崰鐢ㄧ幇閲戯級
         cash = initial_capital + realized_pnl - margin_used
         
         # Position value = quantity * entry price (not margin!)
-        # 中文：名义持仓价值 = 数量 * 开仓均价（这里非保证金金额）
+        # 涓枃锛氬悕涔夋寔浠撲环鍊?= 鏁伴噺 * 寮€浠撳潎浠凤紙杩欓噷闈炰繚璇侀噾閲戦锛?
         positions_value = sum([p['quantity'] * p['avg_price'] for p in positions])
         
         # Total account value = initial capital + realized P&L + unrealized P&L
-        # 中文：账户总价值 = 初始资金 + 已实现盈亏 + 未实现盈亏
+        # 涓枃锛氳处鎴锋€讳环鍊?= 鍒濆璧勯噾 + 宸插疄鐜扮泩浜?+ 鏈疄鐜扮泩浜?
         total_value = initial_capital + realized_pnl + unrealized_pnl
         
         conn.close()
@@ -277,18 +277,18 @@ class Database:
     # ============ Trade Records ============
     
     def add_trade(self, model_id: int, coin: str, signal: str, quantity: float,
-              price: float, leverage: int = 1, side: str = 'long', pnl: float = 0, fee: float = 0):  # 新增fee参数
+              price: float, leverage: int = 1, side: str = 'long', pnl: float = 0, fee: float = 0):  # 鏂板fee鍙傛暟
         """Add trade record with fee"""
         conn = self.get_connection()
         cursor = conn.cursor()
         cursor.execute('''
             INSERT INTO trades (model_id, coin, signal, quantity, price, leverage, side, pnl, fee)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)  # 新增fee字段
-        ''', (model_id, coin, signal, quantity, price, leverage, side, pnl, fee))  # 传入fee值
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (model_id, coin, signal, quantity, price, leverage, side, pnl, fee))  # 浼犲叆fee鍊?
         conn.commit()
         conn.close()
     
-    # 成交历史查询（按时间倒序，限制条数）
+    # 鎴愪氦鍘嗗彶鏌ヨ锛堟寜鏃堕棿鍊掑簭锛岄檺鍒舵潯鏁帮級
     def get_trades(self, model_id: int, limit: int = 50) -> List[Dict]:
         """Get trade history"""
         conn = self.get_connection()
@@ -303,7 +303,7 @@ class Database:
     
     # ============ Conversation History ============
     
-    # 新增对话（存提示/回复/推理链）
+    # 鏂板瀵硅瘽锛堝瓨鎻愮ず/鍥炲/鎺ㄧ悊閾撅級
     def add_conversation(self, model_id: int, user_prompt: str, 
                         ai_response: str, cot_trace: str = ''):
         """Add conversation record"""
@@ -316,7 +316,7 @@ class Database:
         conn.commit()
         conn.close()
     
-    # 对话历史查询
+    # 瀵硅瘽鍘嗗彶鏌ヨ
     def get_conversations(self, model_id: int, limit: int = 20) -> List[Dict]:
         """Get conversation history"""
         conn = self.get_connection()
@@ -331,7 +331,7 @@ class Database:
     
     # ============ Account Value History ============
     
-    # 记录账户价值快照（用于绘图统计）
+    # 璁板綍璐︽埛浠峰€煎揩鐓э紙鐢ㄤ簬缁樺浘缁熻锛?
     def record_account_value(self, model_id: int, total_value: float, 
                             cash: float, positions_value: float):
         """Record account value snapshot"""
@@ -344,7 +344,7 @@ class Database:
         conn.commit()
         conn.close()
     
-    # 某模型净值曲线（账户价值历史）
+    # 鏌愭ā鍨嬪噣鍊兼洸绾匡紙璐︽埛浠峰€煎巻鍙诧級
     def get_account_value_history(self, model_id: int, limit: int = 100) -> List[Dict]:
         """Get account value history"""
         conn = self.get_connection()
@@ -357,7 +357,7 @@ class Database:
         conn.close()
         return [dict(row) for row in rows]
 
-    # 所有模型聚合净值曲线（整体视图）
+    # 鎵€鏈夋ā鍨嬭仛鍚堝噣鍊兼洸绾匡紙鏁翠綋瑙嗗浘锛?
     def get_aggregated_account_value_history(self, limit: int = 100) -> List[Dict]:
         """Get aggregated account value history across all models"""
         conn = self.get_connection()
@@ -400,7 +400,7 @@ class Database:
 
         return result
 
-    # 多模型折线图数据（每模型各取最近 N 条）
+    # 澶氭ā鍨嬫姌绾垮浘鏁版嵁锛堟瘡妯″瀷鍚勫彇鏈€杩?N 鏉★級
     def get_multi_model_chart_data(self, limit: int = 100) -> List[Dict]:
         """Get chart data for all models to display in multi-line chart"""
         conn = self.get_connection()
@@ -445,7 +445,7 @@ class Database:
 
     # ============ Settings Management ============
 
-    # 读取系统设置
+    # 璇诲彇绯荤粺璁剧疆
     def get_settings(self) -> Dict:
         """Get system settings"""
         conn = self.get_connection()
@@ -473,7 +473,7 @@ class Database:
                 'trading_fee_rate': 0.001
             }
 
-    # 更新系统设置
+    # 鏇存柊绯荤粺璁剧疆
     def update_settings(self, trading_frequency_minutes: int, trading_fee_rate: float) -> bool:
         """Update system settings"""
         conn = self.get_connection()
@@ -500,7 +500,7 @@ class Database:
 
     # ============ Provider Management ============
 
-    # 新增服务商
+    # 鏂板鏈嶅姟鍟?
     def add_provider(self, name: str, api_url: str, api_key: str, models: str = '') -> int:
         """Add new API provider"""
         conn = self.get_connection()
@@ -514,7 +514,7 @@ class Database:
         conn.close()
         return provider_id
 
-    # 查询单个服务商
+    # 鏌ヨ鍗曚釜鏈嶅姟鍟?
     def get_provider(self, provider_id: int) -> Optional[Dict]:
         """Get provider information"""
         conn = self.get_connection()
@@ -524,7 +524,7 @@ class Database:
         conn.close()
         return dict(row) if row else None
 
-    # 查询全部服务商
+    # 鏌ヨ鍏ㄩ儴鏈嶅姟鍟?
     def get_all_providers(self) -> List[Dict]:
         """Get all API providers"""
         conn = self.get_connection()
@@ -534,7 +534,7 @@ class Database:
         conn.close()
         return [dict(row) for row in rows]
 
-    # 删除服务商
+    # 鍒犻櫎鏈嶅姟鍟?
     def delete_provider(self, provider_id: int):
         """Delete provider"""
         conn = self.get_connection()
@@ -543,7 +543,7 @@ class Database:
         conn.commit()
         conn.close()
 
-    # 更新服务商
+    # 鏇存柊鏈嶅姟鍟?
     def update_provider(self, provider_id: int, name: str, api_url: str, api_key: str, models: str):
         """Update provider information"""
         conn = self.get_connection()
@@ -558,7 +558,7 @@ class Database:
 
     # ============ Model Management (Updated) ============
 
-    # 新增模型（账户）
+    # 鏂板妯″瀷锛堣处鎴凤級
     def add_model(self, name: str, provider_id: int, model_name: str, initial_capital: float = 10000) -> int:
         """Add new trading model"""
         conn = self.get_connection()
@@ -572,7 +572,7 @@ class Database:
         conn.close()
         return model_id
 
-    # 查询模型详情（含联表的 provider api_url/api_key）
+    # 鏌ヨ妯″瀷璇︽儏锛堝惈鑱旇〃鐨?provider api_url/api_key锛?
     def get_model(self, model_id: int) -> Optional[Dict]:
         """Get model information"""
         conn = self.get_connection()
@@ -587,7 +587,7 @@ class Database:
         conn.close()
         return dict(row) if row else None
 
-    # 查询全部模型列表（含服务商名称）
+    # 鏌ヨ鍏ㄩ儴妯″瀷鍒楄〃锛堝惈鏈嶅姟鍟嗗悕绉帮級
     def get_all_models(self) -> List[Dict]:
         """Get all trading models"""
         conn = self.get_connection()
@@ -601,4 +601,6 @@ class Database:
         rows = cursor.fetchall()
         conn.close()
         return [dict(row) for row in rows]
+
+
 

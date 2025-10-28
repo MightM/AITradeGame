@@ -21,13 +21,10 @@ class AITrader:
 
         decisions = self._parse_response(response)
 
-        # 始终附带原始输出，便于 UI/排查（不会影响交易执行逻辑，因 key 非币种名）
-        merged = {}
-        if isinstance(decisions, dict):
-            merged.update(decisions)
-        if response:
-            merged["_raw_response"] = response
-        return merged
+        # 生产行为：仅在解析失败时，返回原始响应便于排查
+        if not decisions and response:
+            return {"_raw_response": response}
+        return decisions
     
     def _build_prompt(self, market_state: Dict, portfolio: Dict, 
                      account_info: Dict) -> str:
