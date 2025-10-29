@@ -72,6 +72,7 @@ venv.bak/
 *.bak
 *~
 note.md
+product_requirments.md
 
 # OS files
 Thumbs.db
