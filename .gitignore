@@ -71,6 +71,7 @@ venv.bak/
 *.tmp
 *.bak
 *~
+note.md
 
 # OS files
 Thumbs.db
