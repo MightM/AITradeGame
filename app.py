@@ -8,6 +8,7 @@ AITradeGame 的 Flask 应用入口。
 - 逻辑清晰，app.py 只负责路由。
 """
 
+import logging # <-- [TechLead 修复] 确保这一行存在！
 from flask import Flask, render_template, request, jsonify
 from flask_cors import CORS
 import time

@@ -1,21 +1,69 @@
-# AITradeGame 项目指南
 
-AITradeGame 是一个基于 Flask 的加密货币交易模拟器，后端通过 API 拉取行情并驱动交易逻辑，前端使用单页应用展示账户表现。本指南以中文重述项目要点，方便快速入门。
+# AITradeGame 真实交易机器人指南
+项目是一个功能完备的 AI 交易机器人，基于 Flask 框架运行，通过后台 AI 决策连接到 OKX 交易所（模拟盘）执行真实交易。本指南描述了项目的核心架构、环境要求和运行方式。
+
+## 核心架构
+- 交易所集成 (OKX)：所有的数据（价格、K线）和交易执行（市价买卖）均通过 trader.py 模块调用 OKX API 完成。
+- P&L 计算 (混合模式)：项目实现了一个健壮的“混合”P&L 系统：
+- OKX (交易所)：是资产数量的唯一真相来源 (Source of Truth)。
+- 本地数据库 (DB)：是持仓成本 (Avg Price) 的唯一真相来源。
+- 实时技术指标 (TA)：TradingEngine 会获取实时 K 线数据，使用 pandas-ta 库计算技术指标 (SMA, RSI)，并将其提供给 AI。
+- 环境 (Conda)：由于 pandas-ta 复杂的编译依赖，项目使用 Conda (Miniforge) 来管理环境。
 
 ## 项目结构
-- `app.py`：Flask 入口，提供模型管理、交易执行、行情查询、排行榜和系统设置等 REST 接口，同时负责初始化数据库、行情抓取器与交易引擎线程。
-- `trading_engine.py`：封装单个模型的交易循环，调用行情、AI 决策、数据库读写，并记录对话与账户价值。
-- `ai_trader.py`：调用 OpenAI 兼容接口，将行情与仓位信息整合为提示词，让大模型输出 JSON 格式的交易指令。
-- `market_data.py`：优先通过 Binance 获取实时价格，失败时回退 CoinGecko，并计算 SMA、RSI 等技术指标。
-- `database.py`：管理 SQLite 数据库，包含表结构初始化、模型/交易/会话/账户历史等 CRUD 逻辑。
-- `templates/index.html` 与 `static/{app.js,style.css}`：前端界面与交互逻辑，负责模型列表、行情面板、账户图表与设置弹窗的渲染。
-- `config.example.py`：示例配置文件，提供端口、自动交易、刷新频率等默认值，可复制为 `config.py` 做本地覆盖。
+- app.py：Flask 入口 (Web 服务器)。负责 API 路由，并在启动时注入 OkxTrader 实例。
+- trading_engine.py：（核心） 真实交易引擎。它负责：
+ - 从 OkxTrader 获取真实行情和技术指标。
+ - 从 OkxTrader 获取真实余额 (数量)，从 db 获取成本。
+ - 构建一个混合持仓（带 P&L）。
+ - 调用 ai_trader.py 获取决策。
+- 调用 OkxTrader 执行真实交易。
+- 将真实的 P&L 和成本存入数据库。
+- trader.py：（新增核心） 我们的“OKX 工具箱”。OkxTrader 类封装了所有 ccxt 库的复杂性，提供干净的接口（如 get_ticker, get_ohlcv, buy_market）给上层调用。
+- ai_trader.py：AI 决策模块。接收 trading_engine.py 提供的（带指标的）市场数据，并输出 JSON 交易指令。
+- database.py：SQLite 数据库模块。现在主要负责存储持仓成本、已实现盈亏和交易日志。
+- templates/ 和 static/：前端界面。
+- requirements.txt：项目依赖文件，包含 ccxt, pandas, pandas-ta 等。
 
 ## 环境与运行
-- 创建虚拟环境并安装依赖：`python -m venv .venv && source .venv/bin/activate && pip install -r requirements.txt`
-- 本地启动：`python app.py`（默认监听 http://localhost:5002）
-- Docker 工作流：`docker-compose up -d` 启动，`docker-compose down` 停止并释放卷
-- 生成可执行程序：`pyinstaller app.py --name AITradeGame`
+项目使用 Conda (Miniforge) 来解决 pandas-ta 在 macOS (Intel/M1) 上的编译问题。
+1. 安装 Conda (Miniforge)
+- Intel Mac (i5/i7/i9):
+curl -L -O "[https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-MacOSX-x86_64.sh](https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-MacOSX-x86_64.sh)"
+bash Miniforge3-MacOSX-x86_64.sh
+- Apple M1/M2/M3 Mac:
+curl -L -O "[https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-MacOSX-arm64.sh](https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-MacOSX-arm64.sh)"
+bash Miniforge3-MacOSX-arm64.sh  (按照提示完成安装，并在最后一步选择 yes 来初始化 conda init)
+
+2. 创建并激活环境
+- 完全关闭并重新打开你的终端。
+- 创建 aitrade 环境：conda create -n aitrade python=3.9
+- 激活环境：conda activate aitrade  (你的终端提示符现在应为 (aitrade))
+
+3. 安装依赖 (两步法)
+- 第一步 (Conda 安装科学计算包)：conda install -c conda-forge pandas="2.0.3" pandas-ta="0.3.14" ccxt
+- 第二步 (Pip 安装应用包)：pip install flask flask-cors openai requests
+
+
+4. 设置 API 密钥 (环境变量)
+- 你必须在运行前设置你的 OKX 模拟盘 API 密钥：
+ - export OKX_API_KEY='你的API Key'
+ - export OKX_SECRET='你的Secret'
+ - export OKX_PASSPHRASE='你的Passphrase'
+
+5. 运行机器人
+- 确保你的提示符是 (aitrade) 并且 API 密钥已设置：
+
+### 永远使用 'python' (不要用 'python3')
+- python app.py  程序将启动，3分钟后（默认）开始第一个自动交易循环。
+
+## 功能特性列表
+- 模型管理：支持录入 API 提供方、创建多模型账号。
+- 行情采集：100% 从 OKX 交易所获取实时 Ticker 和 OHLCV (K线) 数据。
+- AI 决策：AI 分析实时的技术指标 (SMA, RSI) 和真实的 P&L（盈亏）数据来做出决策。
+- 交易执行：在 OKX 模拟盘上执行真实的市价买卖订单。
+- P&L 跟踪：使用“OKX 数量 + 本地 DB 成本”的混合模式，精确计算已实现和未实现的盈亏。
+- 数据可视化：前端展示账户总值、盈亏、成交记录与 AI 对话历史。
 
 ## 代码规范
 - 目标 Python 版本 3.9+，遵循 PEP 8，函数/模块用 snake_case，类名使用 CapWords。
