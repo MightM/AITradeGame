@@ -1,64 +1,68 @@
 """
 AITradeGame 的 Flask 应用入口。
 
-[TechLead 改造版 - 最终版 v2 (清理完毕)]
-- 彻底移除了旧的 MarketDataFetcher (market_data.py 可以删除了)。
-- 全局只使用 okx_trader (我们唯一的"真相来源")。
-- API 端点现在调用 okx_trader 和 trading_engine 的公开辅助方法。
-- 逻辑清晰，app.py 只负责路由。
+[TechLead V2.0 改造版]
+- 移除了旧的 MarketDataFetcher。
+- 所有 API 路由现在都依赖于 OkxTrader (self.trader) 作为数据源。
+- 禁用了 Flask (werkzeug) 的访问日志，以保持终端清洁。
 """
 
-import logging # <-- [TechLead 修复] 确保这一行存在！
-from flask import Flask, render_template, request, jsonify
-from flask_cors import CORS
-import time
+import logging # [TechLead 修复] 导入 logging
+import os
 import threading
+import time
 import json
 import re
-import os 
 from datetime import datetime
+
+from flask import Flask, render_template, request, jsonify
+from flask_cors import CORS
+
+from trader import OkxTrader # [V2.0] 我们的核心交易器
 from trading_engine import TradingEngine
 from ai_trader import AITrader
 from database import Database
 from version import __version__, __github_owner__, __repo__, GITHUB_REPO_URL, LATEST_RELEASE_URL
-from trader import OkxTrader # [TechLead] 导入我们强大的 Trader
+
+# [TechLead 修复] 禁用 Flask (Werkzeug) 的 127.0.0.1... GET/POST 日志
+# 必须在 app = Flask(...) 之前设置
+log = logging.getLogger('werkzeug')
+log.setLevel(logging.ERROR)
 
 app = Flask(__name__)
 CORS(app)
 
+# --- [V2.0] 全局单例对象 ---
+db = Database('AITradeGame.db')
+trading_engines = {}                     # 交易引擎池：{model_id: TradingEngine}
+auto_trading = True                      # 启用后台自动交易循环
+TRADE_FEE_RATE = 0.001                   # 默认交易费率（千分之一）
 
-# [TechLead 修复] 禁用 Flask (Werkzeug) 的 127.0.0.1... GET/POST 日志
-log = logging.getLogger('werkzeug')
-log.setLevel(logging.ERROR)
-
-
-# --- [TechLead] 全局初始化我们的 OkxTrader ---
-okx_trader = None
+# [V2.0 核心] 在全局初始化我们的 OkxTrader
+# 它将使用环境变量自动连接到 OKX 模拟盘
 try:
     print("[INFO] 正在初始化 OkxTrader (连接到 OKX 模拟盘)...")
-    okx_trader = OkxTrader(
-        api_key=os.environ.get('OKX_API_KEY'),
-        secret=os.environ.get('OKX_SECRET'),
-        passphrase=os.environ.get('OKX_PASSPHRASE')
-    )
+    API_KEY = os.environ.get('OKX_API_KEY')
+    SECRET = os.environ.get('OKX_SECRET')
+    PASSPHRASE = os.environ.get('OKX_PASSPHRASE')
+    
+    if not all([API_KEY, SECRET, PASSPHRASE]):
+        print("[CRITICAL] 启动失败：请先设置 OKX_API_KEY, OKX_SECRET, 和 OKX_PASSPHRASE 环境变量。")
+        exit()
+        
+    okx_trader = OkxTrader(API_KEY, SECRET, PASSPHRASE, is_demo=True)
     print("[INFO] OkxTrader 初始化成功。")
 except Exception as e:
     print(f"[CRITICAL] OkxTrader 初始化失败: {e}")
-    print("[CRITICAL] 机器人无法连接交易所，将退出。")
-    exit() 
-# --- OkxTrader 初始化完毕 ---
+    okx_trader = None
+# --- 结束 V2.0 全局对象 ---
 
-
-# 全局单例对象：
-db = Database('AITradeGame.db')
-trading_engines = {}
-auto_trading = True
 
 @app.route('/')
 def index():
     return render_template('index.html')
 
-# ============ Provider API Endpoints (无变化) ============
+# ============ Provider API Endpoints (不变) ============
 @app.route('/api/providers', methods=['GET'])
 def get_providers():
     providers = db.get_all_providers()
@@ -91,33 +95,41 @@ def fetch_provider_models():
     data = request.json
     api_url = data.get('api_url')
     api_key = data.get('api_key')
+
     if not api_url or not api_key:
         return jsonify({'error': 'API URL and key are required'}), 400
+
     try:
         models = []
         if 'openai.com' in api_url.lower():
             import requests
-            headers = {'Authorization': f'Bearer {api_key}', 'Content-Type': 'application/json'}
+            headers = {
+                'Authorization': f'Bearer {api_key}',
+                'Content-Type': 'application/json'
+            }
             response = requests.get(f'{api_url}/models', headers=headers, timeout=10)
             if response.status_code == 200:
                 result = response.json()
                 models = [m['id'] for m in result.get('data', []) if 'gpt' in m['id'].lower()]
         elif 'deepseek' in api_url.lower():
             import requests
-            headers = {'Authorization': f'Bearer {api_key}', 'Content-Type': 'application/json'}
+            headers = {
+                'Authorization': f'Bearer {api_key}',
+                'Content-Type': 'application/json'
+            }
             response = requests.get(f'{api_url}/models', headers=headers, timeout=10)
             if response.status_code == 200:
                 result = response.json()
                 models = [m['id'] for m in result.get('data', [])]
         else:
             models = ['gpt-3.5-turbo', 'gpt-4', 'gpt-4-turbo']
+
         return jsonify({'models': models})
     except Exception as e:
         print(f"[ERROR] Fetch models failed: {e}")
         return jsonify({'error': f'Failed to fetch models: {str(e)}'}), 500
 
-# ============ Model API Endpoints (升级) ============
-
+# ============ Model API Endpoints ([V2.0] 改造) ============
 @app.route('/api/models', methods=['GET'])
 def get_models():
     models = db.get_all_models()
@@ -127,14 +139,34 @@ def get_models():
 def add_model():
     data = request.json
     try:
+        provider = db.get_provider(data['provider_id'])
+        if not provider:
+            return jsonify({'error': 'Provider not found'}), 404
+
         model_id = db.add_model(
             name=data['name'],
             provider_id=data['provider_id'],
             model_name=data['model_name'],
             initial_capital=float(data.get('initial_capital', 100000))
         )
-        # [TechLead] 引擎将在第一次被需要时 (通过 API 或 trading_loop) 按需初始化
-        print(f"[INFO] Model {model_id} ({data['name']}) 已添加到 DB")
+
+        model = db.get_model(model_id)
+        
+        # [V2.0 改造] 注入 okx_trader
+        trading_engines[model_id] = TradingEngine(
+            model_id=model_id,
+            db=db,
+            market_fetcher=None, # [V2.0] 禁用
+            ai_trader=AITrader(
+                api_key=model['api_key'],
+                api_url=model['api_url'],
+                model_name=model['model_name']
+            ),
+            trade_fee_rate=TRADE_FEE_RATE,
+            okx_trader=okx_trader # [V2.0] 注入！
+        )
+        print(f"[INFO] Model {model_id} ({data['name']}) initialized")
+
         return jsonify({'id': model_id, 'message': 'Model added successfully'})
 
     except Exception as e:
@@ -146,9 +178,11 @@ def delete_model(model_id):
     try:
         model = db.get_model(model_id)
         model_name = model['name'] if model else f"ID-{model_id}"
+        
         db.delete_model(model_id)
         if model_id in trading_engines:
             del trading_engines[model_id]
+        
         print(f"[INFO] Model {model_id} ({model_name}) deleted")
         return jsonify({'message': 'Model deleted successfully'})
     except Exception as e:
@@ -158,43 +192,47 @@ def delete_model(model_id):
 @app.route('/api/models/<int:model_id>/portfolio', methods=['GET'])
 def get_portfolio(model_id):
     """
-    [TechLead 升级]
-    此 API 端点现在非常干净。
+    [V2.0 改造]
+    获取单个模型的详细持仓视图。
+    数据源现在是 okx_trader (真实余额) + db (成本) 的混合体。
     """
-    try:
-        # 1. 确保引擎已初始化
-        _initialize_single_engine(model_id)
-            
-        # 2. 从 OKX 获取价格
-        prices_data = okx_trader.get_current_prices(['BTC', 'ETH', 'SOL', 'BNB', 'XRP', 'DOGE'])
-        current_prices = {coin: prices_data[coin]['price'] for coin in prices_data if prices_data[coin]['price'] > 0}
+    if not okx_trader:
+        return jsonify({'error': 'OkxTrader is not initialized'}), 500
         
-        # 3. 从 OKX 获取真实余额
+    try:
+        # 1. [真实] 从 OKX 获取市场状态 (用于计算 P&L)
+        market_state = okx_trader.get_current_prices_for_api()
+        
+        # 2. [真实] 从 OKX 获取账户余额 (数量真相)
         real_balance = okx_trader.get_balance()
         
-        # 4. 从 DB 获取成本
-        db_portfolio = db.get_portfolio(model_id, current_prices)
+        # 3. [本地] 从 DB 获取持仓成本 (成本真相)
+        db_portfolio = db.get_portfolio(model_id, market_state)
         
-        # 5. [干净] 调用 Trader 的辅助方法来构建视图
-        portfolio_view = okx_trader.build_hybrid_portfolio(real_balance, db_portfolio['positions'], prices_data)
-        account_info = okx_trader.build_account_info(portfolio_view, db_portfolio, model_id, db)
+        # 4. [混合] 合成 AI 能看懂的、带 P&L 的持仓
+        # 这是“只读”的，用于前端显示
+        portfolio_view = okx_trader.build_hybrid_portfolio(
+            real_balance, 
+            db_portfolio['positions'], 
+            market_state
+        )
         
-        # 6. 获取净值曲线
+        # 5. [混合] 构建账户信息 (包含已实现 P&L)
+        account_info = okx_trader.build_account_info(
+            portfolio_view, 
+            db_portfolio, 
+            model_id, 
+            db
+        )
+        
+        # 6. 获取账户价值历史 (来自 DB)
         account_value_history = db.get_account_value_history(model_id, limit=100)
         
-        # 7. 合并前端所需的数据
-        final_portfolio_view = {
-            'total_value': account_info['total_value'],
-            'cash': portfolio_view['cash'],
-            'positions_value': portfolio_view['positions_value'],
-            'realized_pnl': account_info['realized_pnl'],
-            'unrealized_pnl': account_info['unrealized_pnl'],
-            'initial_capital': account_info['initial_capital'],
-            'positions': portfolio_view['positions']
-        }
-
+        # 合并 portfolio_view 和 account_info
+        portfolio_view.update(account_info)
+        
         return jsonify({
-            'portfolio': final_portfolio_view,
+            'portfolio': portfolio_view,
             'account_value_history': account_value_history
         })
         
@@ -220,114 +258,132 @@ def get_conversations(model_id):
 @app.route('/api/aggregated/portfolio', methods=['GET'])
 def get_aggregated_portfolio():
     """
-    [TechLead 升级]
+    [V2.0 改造]
     汇总所有模型的资产与持仓。
+    数据源现在是 okx_trader (真实余额) + db (成本)。
     """
-    prices_data = okx_trader.get_current_prices(['BTC', 'ETH', 'SOL', 'BNB', 'XRP', 'DOGE'])
-    current_prices = {coin: prices_data[coin]['price'] for coin in prices_data if prices_data[coin]['price'] > 0}
+    if not okx_trader:
+        return jsonify({'error': 'OkxTrader is not initialized'}), 500
+        
+    try:
+        # 1. [真实] 获取价格
+        market_state = okx_trader.get_current_prices_for_api()
+        
+        # 2. [真实] 获取余额
+        real_balance = okx_trader.get_balance()
+        
+        # 3. [本地] 获取所有模型的成本 和 已实现P&L
+        models = db.get_all_models()
+        total_realized_pnl = 0
+        all_positions_cost = []
+        total_initial_capital = 0
 
-    models = db.get_all_models()
-    total_portfolio = {
-        'total_value': 0, 'cash': 0, 'positions_value': 0,
-        'realized_pnl': 0, 'unrealized_pnl': 0, 'initial_capital': 0,
-        'positions': []
-    }
-    all_positions = {}
+        for model in models:
+            db_portfolio = db.get_portfolio(model['id'], market_state)
+            total_realized_pnl += db_portfolio.get('realized_pnl', 0)
+            all_positions_cost.extend(db_portfolio.get('positions', []))
+            total_initial_capital += model.get('initial_capital', 0)
 
-    # [TechLead] 我们只从 OKX 获取一次总余额
-    real_balance = okx_trader.get_balance() 
+        # 4. [混合] 构建总览持仓
+        # 注意：这里的 'positions' 只是用于前端显示的聚合列表
+        total_portfolio = okx_trader.build_hybrid_portfolio(
+            real_balance, 
+            all_positions_cost, # [TechLead] 注意：这里没有按模型合并，只是简单聚合
+            market_state
+        )
+        
+        # 5. [混合] 注入已实现 P&L 和初始资本
+        total_portfolio['realized_pnl'] = total_realized_pnl
+        total_portfolio['initial_capital'] = total_initial_capital
+        
+        # 6. [本地] 获取多模型图表数据
+        chart_data = db.get_multi_model_chart_data(limit=100)
 
-    for model in models:
-        try:
-            db_portfolio = db.get_portfolio(model['id'], current_prices)
-            
-            # [干净] 调用 Trader 辅助方法
-            portfolio_view = okx_trader.build_hybrid_portfolio(real_balance, db_portfolio['positions'], prices_data)
-            account_info = okx_trader.build_account_info(portfolio_view, db_portfolio, model['id'], db)
-
-            total_portfolio['total_value'] += account_info.get('total_value', 0)
-            total_portfolio['cash'] += portfolio_view.get('cash', 0)
-            total_portfolio['positions_value'] += portfolio_view.get('positions_value', 0)
-            total_portfolio['realized_pnl'] += account_info.get('realized_pnl', 0)
-            total_portfolio['unrealized_pnl'] += account_info.get('unrealized_pnl', 0)
-            total_portfolio['initial_capital'] += account_info.get('initial_capital', 0)
-
-            for pos in portfolio_view.get('positions', []):
-                key = f"{pos['coin']}_{pos['side']}"
-                if key not in all_positions:
-                    all_positions[key] = {
-                        'coin': pos['coin'], 'side': pos['side'], 'quantity': 0,
-                        'avg_price': 0, 'total_cost': 0, 'leverage': pos['leverage'],
-                        'current_price': pos['current_price'], 'pnl': 0
-                    }
-                
-                current_pos = all_positions[key]
-                current_cost = current_pos['quantity'] * current_pos['avg_price']
-                new_cost = pos['quantity'] * pos['avg_price']
-                total_quantity = current_pos['quantity'] + pos['quantity']
-
-                if total_quantity > 0:
-                    current_pos['avg_price'] = (current_cost + new_cost) / total_quantity
-                    current_pos['quantity'] = total_quantity
-                    current_pos['total_cost'] = current_cost + new_cost
-                    current_pos['pnl'] += pos.get('pnl', 0)
-                
-        except Exception as e:
-            print(f"[ERROR] /api/aggregated/portfolio: Failed to process model {model['id']}: {e}")
-            continue
-
-    total_portfolio['positions'] = list(all_positions.values())
-    chart_data = db.get_multi_model_chart_data(limit=100)
-
-    return jsonify({
-        'portfolio': total_portfolio,
-        'chart_data': chart_data,
-        'model_count': len(models)
-    })
+        return jsonify({
+            'portfolio': total_portfolio,
+            'chart_data': chart_data,
+            'model_count': len(models)
+        })
+    except Exception as e:
+        print(f"[ERROR] /api/aggregated/portfolio failed: {e}")
+        import traceback
+        print(traceback.format_exc())
+        return jsonify({'error': str(e)}), 500
 
 @app.route('/api/models/chart-data', methods=['GET'])
 def get_models_chart_data():
     limit = request.args.get('limit', 100, type=int)
-    chart_data = db.get_multi_model_chart_data(limit=100)
+    chart_data = db.get_multi_model_chart_data(limit=limit)
     return jsonify(chart_data)
 
 @app.route('/api/market/prices', methods=['GET'])
 def get_market_prices():
     """
-    [TechLead 升级] 
-    此接口现在 100% 由 OKX 驱动。
+    [V2.0 改造]
+    从 okx_trader (真实) 获取价格，而不是 market_fetcher (模拟)。
     """
-    prices = okx_trader.get_current_prices(['BTC', 'ETH', 'SOL', 'BNB', 'XRP', 'DOGE'])
-    return jsonify(prices)
+    if not okx_trader:
+        return jsonify({'error': 'OkxTrader is not initialized'}), 500
+        
+    try:
+        prices = okx_trader.get_current_prices_for_api()
+        return jsonify(prices)
+    except Exception as e:
+        print(f"[ERROR] /api/market/prices failed: {e}")
+        return jsonify({'error': str(e)}), 500
+
 
 @app.route('/api/models/<int:model_id>/execute', methods=['POST'])
 def execute_trading(model_id):
+    # 手动触发指定模型执行一次完整“交易循环”
+    if model_id not in trading_engines:
+        model = db.get_model(model_id)
+        if not model:
+            return jsonify({'error': 'Model not found'}), 404
+
+        provider = db.get_provider(model['provider_id'])
+        if not provider:
+            return jsonify({'error': 'Provider not found'}), 404
+
+        # [V2.0 改造] 注入 okx_trader
+        trading_engines[model_id] = TradingEngine(
+            model_id=model_id,
+            db=db,
+            market_fetcher=None, # [V2.0] 禁用
+            ai_trader=AITrader(
+                api_key=provider['api_key'],
+                api_url=provider['api_url'],
+                model_name=model['model_name']
+            ),
+            trade_fee_rate=TRADE_FEE_RATE,
+            okx_trader=okx_trader # [V2.0] 注入！
+        )
+    
     try:
-        _initialize_single_engine(model_id)
         result = trading_engines[model_id].execute_trading_cycle()
         return jsonify(result)
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
 def trading_loop():
+    # 后台自动交易循环
     print("[INFO] Trading loop started")
     
-    trade_interval_seconds = 180 # 默认
+    # [V2.0] 从 DB 加载交易频率
     try:
         settings = db.get_settings()
-        trade_interval_seconds = int(settings.get('trading_frequency_minutes', 3)) * 60
-        print(f"[INFO] 交易循环频率设置为: {trade_interval_seconds} 秒")
+        # 转换为秒
+        SLEEP_DURATION = settings.get('trading_frequency_minutes', 3) * 60 
+        print(f"[INFO] 交易频率设置为: {SLEEP_DURATION} 秒 ({settings.get('trading_frequency_minutes', 3)} 分钟)")
     except Exception as e:
-        print(f"[WARN] 无法从 DB 获取交易频率, 默认 180 秒: {e}")
-
+        print(f"[WARN] 无法从 DB 加载交易频率, 默认 180 秒: {e}")
+        SLEEP_DURATION = 180
     
     while auto_trading:
         try:
-            init_trading_engines() 
-            
             if not trading_engines:
-                print("[INFO] Trading loop: 没有激活的模型, 暂停 30 秒...")
-                time.sleep(30)
+                print(f"[SLEEP] 没有活动的模型, {SLEEP_DURATION} 秒后重试...")
+                time.sleep(SLEEP_DURATION)
                 continue
             
             print(f"\n{'='*60}")
@@ -347,10 +403,10 @@ def trading_loop():
                                 signal = exec_result.get('signal', 'unknown')
                                 coin = exec_result.get('coin', 'unknown')
                                 msg = exec_result.get('message', '')
-                                if signal != 'hold' and not exec_result.get('error'):
+                                if signal != 'hold' and 'error' not in exec_result:
                                     print(f"  [TRADE] {coin}: {msg}")
-                                elif exec_result.get('error'):
-                                     print(f"  [TRADE_FAIL] {coin}: {exec_result.get('error')}")
+                                elif 'error' in exec_result:
+                                    print(f"  [TRADE_FAIL] {coin}: {exec_result['error']}")
                     else:
                         error = result.get('error', 'Unknown error')
                         print(f"[WARN] Model {model_id} failed: {error}")
@@ -362,10 +418,10 @@ def trading_loop():
                     continue
             
             print(f"\n{'='*60}")
-            print(f"[SLEEP] Waiting {trade_interval_seconds} seconds for next cycle")
+            print(f"[SLEEP] Waiting {SLEEP_DURATION} seconds for next cycle")
             print(f"{'='*60}\n")
             
-            time.sleep(trade_interval_seconds)
+            time.sleep(SLEEP_DURATION)
             
         except Exception as e:
             print(f"\n[CRITICAL] Trading loop error: {e}")
@@ -378,39 +434,56 @@ def trading_loop():
 
 @app.route('/api/leaderboard', methods=['GET'])
 def get_leaderboard():
-    models = db.get_all_models()
+    """
+    [V2.0 改造]
+    排行榜现在也使用“混合模式”来获取真实的账户价值。
+    """
+    if not okx_trader:
+        return jsonify({'error': 'OkxTrader is not initialized'}), 500
+        
     leaderboard = []
     
-    prices_data = okx_trader.get_current_prices(['BTC', 'ETH', 'SOL', 'BNB', 'XRP', 'DOGE'])
-    current_prices = {coin: prices_data[coin]['price'] for coin in prices_data if prices_data[coin]['price'] > 0}
-    
-    real_balance = okx_trader.get_balance() 
+    try:
+        market_state = okx_trader.get_current_prices_for_api()
+        real_balance = okx_trader.get_balance()
+        models = db.get_all_models()
 
-    for model in models:
-        try:
-            db_portfolio = db.get_portfolio(model['id'], current_prices)
+        for model in models:
+            model_id = model['id']
+            initial_capital = model['initial_capital']
             
-            portfolio_view = okx_trader.build_hybrid_portfolio(real_balance, db_portfolio['positions'], prices_data)
-            account_info = okx_trader.build_account_info(portfolio_view, db_portfolio, model['id'], db)
+            db_portfolio = db.get_portfolio(model_id, market_state)
             
-            account_value = account_info.get('total_value', model['initial_capital'])
+            # [V2.0] 我们必须为 *每个* 模型构建其 P&L 视图
+            # 注意：这在模型很多时会很慢，但现在是准确的
+            portfolio_view = okx_trader.build_hybrid_portfolio(
+                real_balance, 
+                db_portfolio['positions'], 
+                market_state
+            )
+            
+            account_value = portfolio_view.get('total_value', initial_capital)
             returns = 0
-            if model['initial_capital'] > 0:
-                returns = ((account_value - model['initial_capital']) / model['initial_capital']) * 100
+            if initial_capital > 0:
+                returns = ((account_value - initial_capital) / initial_capital) * 100
             
             leaderboard.append({
-                'model_id': model['id'],
+                'model_id': model_id,
                 'model_name': model['name'],
                 'account_value': account_value,
                 'returns': returns,
-                'initial_capital': model['initial_capital']
+                'initial_capital': initial_capital
             })
-        except Exception as e:
-            print(f"[ERROR] /api/leaderboard: Failed to process model {model['id']}: {e}")
-            continue
+        
+        leaderboard.sort(key=lambda x: x['returns'], reverse=True)
+        return jsonify(leaderboard)
+        
+    except Exception as e:
+        print(f"[ERROR] /api/leaderboard failed: {e}")
+        import traceback
+        print(traceback.format_exc())
+        return jsonify({'error': str(e)}), 500
 
-    leaderboard.sort(key=lambda x: x['returns'], reverse=True)
-    return jsonify(leaderboard)
 
 @app.route('/api/settings', methods=['GET'])
 def get_settings():
@@ -422,19 +495,22 @@ def get_settings():
 
 @app.route('/api/settings', methods=['PUT'])
 def update_settings():
+    # [V2.0 改造] 只允许更新频率。费率现在是真实发生的，不能配置。
     try:
         data = request.json
         trading_frequency_minutes = int(data.get('trading_frequency_minutes', 3))
-        
-        success = db.update_settings(trading_frequency_minutes) 
+
+        success = db.update_settings(trading_frequency_minutes)
 
         if success:
-            return jsonify({'success': True, 'message': 'Settings updated. Restart app to apply new trading frequency.'})
+            print("[INFO] Settings updated. Trading loop will update frequency on next cycle.")
+            return jsonify({'success': True, 'message': 'Settings updated successfully'})
         else:
             return jsonify({'success': False, 'error': 'Failed to update settings'}), 500
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
+# ============ Version & Update (不变) ============
 @app.route('/api/version', methods=['GET'])
 def get_version():
     return jsonify({
@@ -447,7 +523,10 @@ def get_version():
 def check_update():
     try:
         import requests
-        headers = {'Accept': 'application/vnd.github.v3+json', 'User-Agent': 'AITradeGame/1.0'}
+        headers = {
+            'Accept': 'application/vnd.github.v3+json',
+            'User-Agent': 'AITradeGame/1.0'
+        }
         try:
             response = requests.get(
                 f"https://api.github.com/repos/{__github_owner__}/{__repo__}/releases/latest",
@@ -461,18 +540,34 @@ def check_update():
                 release_notes = release_data.get('body', '')
                 is_update_available = compare_versions(latest_version, __version__) > 0
                 return jsonify({
-                    'update_available': is_update_available, 'current_version': __version__,
-                    'latest_version': latest_version, 'release_url': release_url,
-                    'release_notes': release_notes, 'repo_url': GITHUB_REPO_URL
+                    'update_available': is_update_available,
+                    'current_version': __version__,
+                    'latest_version': latest_version,
+                    'release_url': release_url,
+                    'release_notes': release_notes,
+                    'repo_url': GITHUB_REPO_URL
                 })
             else:
-                return jsonify({'update_available': False, 'current_version': __version__, 'error': 'Could not check for updates'})
+                return jsonify({
+                    'update_available': False,
+                    'current_version': __version__,
+                    'error': 'Could not check for updates'
+                })
         except Exception as e:
             print(f"[WARN] GitHub API error: {e}")
-            return jsonify({'update_available': False, 'current_version': __version__, 'error': 'Network error checking updates'})
+            return jsonify({
+                'update_available': False,
+                'current_version': __version__,
+                'error': 'Network error checking updates'
+            })
+
     except Exception as e:
         print(f"[ERROR] Check update failed: {e}")
-        return jsonify({'update_available': False, 'current_version': __version__, 'error': str(e)}), 500
+        return jsonify({
+            'update_available': False,
+            'current_version': __version__,
+            'error': str(e)
+        }), 500
 
 def compare_versions(version1, version2):
     def normalize(v):
@@ -487,85 +582,68 @@ def compare_versions(version1, version2):
     elif v1_parts < v2_parts: return -1
     else: return 0
 
-def _initialize_single_engine(model_id: int):
-    """
-    [TechLead 新增]
-    一个辅助函数，用于按需初始化单个 trading engine。
-    """
-    if model_id in trading_engines:
-        return True 
-
-    print(f"[INFO] 按需初始化引擎 (On-demand init): Model {model_id}...")
-    model = db.get_model(model_id)
-    if not model: 
-        raise Exception(f"Model {model_id} not found in database")
-    
-    provider = db.get_provider(model['provider_id'])
-    if not provider: 
-        raise Exception(f"Provider {model['provider_id']} for model {model_id} not found")
-
-    trading_engines[model_id] = TradingEngine(
-        model_id=model_id,
-        db=db,
-        market_fetcher=None, # [TechLead 移除]
-        ai_trader=AITrader(
-            api_key=provider['api_key'],
-            api_url=provider['api_url'],
-            model_name=model['model_name']
-        ),
-        okx_trader=okx_trader # [TechLead 注入]
-    )
-    print(f"  [OK] Model {model_id} ({model['name']}) 已初始化")
-    return True
-
 def init_trading_engines():
-    """
-    [TechLead 升级]
-    此函数现在只 *检查* 列表，并按需加载。
-    """
+    # 程序启动时：为 DB 中已有的模型创建 TradingEngine
     try:
         models = db.get_all_models()
         if not models:
-            print("[WARN] No trading models found in DB")
+            print("[WARN] No trading models found in database.")
             return
-        
-        print(f"\n[INIT] 正在检查 {len(models)} 个模型的引擎...")
+            
+        if not okx_trader:
+            print("[ERROR] OkxTrader 未初始化, 无法创建 trading engines。")
+            return
+
+        print(f"\n[INIT] Initializing trading engines...")
         for model in models:
             model_id = model['id']
-            if model_id not in trading_engines:
-                try:
-                    _initialize_single_engine(model_id)
-                except Exception as e:
-                    print(f"  [ERROR] Model {model_id} ({model['name']}): {e}")
+            model_name = model['name']
+            try:
+                provider = db.get_provider(model['provider_id'])
+                if not provider:
+                    print(f"  [WARN] Model {model_id} ({model_name}): Provider not found")
                     continue
-            
-        print(f"[INFO] 引擎检查完毕。当前已激活: {len(trading_engines)} 个")
 
+                # [V2.0 改造] 注入 okx_trader
+                trading_engines[model_id] = TradingEngine(
+                    model_id=model_id,
+                    db=db,
+                    market_fetcher=None, # [V2.0] 禁用
+                    ai_trader=AITrader(
+                        api_key=provider['api_key'],
+                        api_url=provider['api_url'],
+                        model_name=model['model_name']
+                    ),
+                    trade_fee_rate=TRADE_FEE_RATE,
+                    okx_trader=okx_trader # [V2.0] 注入！
+                )
+                print(f"  [OK] Model {model_id} ({model_name})")
+            except Exception as e:
+                print(f"  [ERROR] Model {model_id} ({model_name}): {e}")
+                continue
+        print(f"[INFO] Initialized {len(trading_engines)} engine(s)\n")
     except Exception as e:
         print(f"[ERROR] Init engines failed: {e}\n")
 
 if __name__ == '__main__':
     import webbrowser
+    import os
     
     print("\n" + "=" * 60)
     print("AITradeGame - Starting...")
     print("=" * 60)
     
+    # [V2.0] 只有 okx_trader 成功初始化后才继续
     if not okx_trader:
-        print("[CRITICAL] OkxTrader 未能启动，请检查你的 API 密钥环境变量。")
-        print("=" * 60 + "\n")
+        print("[CRITICAL] OkxTrader failed to initialize. Exiting.")
         exit()
         
     print("[INFO] Initializing database...")
     db.init_db()
-    
-    try:
-        db.upgrade_db_schema() 
-    except Exception as e:
-        print(f"[WARN] DB Schema upgrade failed, may be normal: {e}")
-
     print("[INFO] Database initialized")
-    print("[INFO] Initializing trading engines (on-demand)...")
+    print("[INFO] Initializing trading engines...")
+    
+    init_trading_engines()
     
     if auto_trading:
         trading_thread = threading.Thread(target=trading_loop, daemon=True)
@@ -590,5 +668,6 @@ if __name__ == '__main__':
     browser_thread = threading.Thread(target=open_browser, daemon=True)
     browser_thread.start()
     
+    # [TechLead 修复] 禁用 reloader, 因为它会运行两次 init
     app.run(debug=False, host='0.0.0.0', port=5002, use_reloader=False)
 

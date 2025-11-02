@@ -29,13 +29,17 @@ class OkxTrader:
     """
     
     def __init__(self, api_key: str, secret: str, passphrase: str, is_demo=True):
-        print("正在初始化 OkxTrader...")
+        print("正在初始化 OkxTrader (v2.0 合约模式)...") # <-- [修改]
         self.exchange = ccxt.okx({
             'apiKey': api_key,
             'secret': secret,
             'password': passphrase,
             'options': {
-                'defaultType': 'spot',
+                # [V2.0 升级] 切换到 SWAP (合约) 模式
+                'defaultType': 'swap', 
+                # [V2.0 升级] OKX 统一账户需要指定 'account'
+                # 我们假设是 'futures' (合约) 账户
+                'accounts': ['futures'], 
             },
         })
         
@@ -187,6 +191,80 @@ class OkxTrader:
         except Exception as e:
             print(f"[ERROR] get_ohlcv({symbol}) 失败: {e}")
             return []
+            
+    def get_open_interest(self, symbol: str) -> Dict:
+        """
+        [V2.0 新增 - 6.3] 获取合约的未平仓合约量 (Open Interest)。
+        """
+        print(f"正在调用: get_open_interest(symbol={symbol})")
+        try:
+            # ccxt's fetchOpenInterest (OI)
+            # OKX 返回 OI (oiCcy) e.g., 'BTC' or 'USDT'
+            oi_data = self.exchange.fetch_open_interest(symbol)
+            return {
+                # e.g., OI in BTC
+                'open_interest_base': oi_data.get('baseVolume', 0),
+                # e.g., OI in USDT
+                'open_interest_quote': oi_data.get('quoteVolume', 0),
+                'info': oi_data.get('info', {})  # 原始数据
+            }
+        except Exception as e:
+            print(f"[ERROR] 获取 {symbol} Open Interest 失败: {e}")
+            return {}
+
+    def get_funding_rate(self, symbol: str) -> Dict:
+        """
+        [V2.0 新增 - 6.3] 获取永续合约的资金费率 (Funding Rate)。
+        """
+        print(f"正在调用: get_funding_rate(symbol={symbol})")
+        try:
+            # ccxt's fetchFundingRate
+            fr_data = self.exchange.fetch_funding_rate(symbol)
+            return {
+                'funding_rate': fr_data.get('fundingRate', 0),      # 下一个资金费率
+                # ms timestamp
+                'next_funding_time': fr_data.get('nextFundingTime', 0),
+                'mark_price': fr_data.get('markPrice', 0),          # 标记价格
+                'info': fr_data.get('info', {})                    # 原始数据
+            }
+        except Exception as e:
+            print(f"[ERROR] 获取 {symbol} Funding Rate 失败: {e}")
+            return {}
+        
+    # [!!!] 修复：开始于此
+    # 修正了 set_leverage 方法以适应 OKX 统一账户
+    def set_leverage(self, symbol: str, leverage: int, margin_mode: str = 'isolated'):
+        print(f"正在调用: set_leverage(symbol={symbol}, leverage={leverage}, mode={margin_mode})")
+        try:
+            # [!!!] 修复：
+            # 对于 OKX 统一账户 (SWAP 模式)，我们不需要单独调用 set_margin_mode。
+            # ccxt 的 set_leverage 方法可以同时设置杠杆和保证金模式。
+            
+            # 我们将 margin_mode ('isolated' or 'cross') 放入 params 字典中。
+            # OKX 永续合约还需要 'posSide' (持仓方向)。
+            # 'net' = 单向持仓模式 (默认)
+            # 'long'/'short' = 双向持仓模式
+            
+            print(f"  > 正在统一设置杠杆: {leverage}x, 模式: {margin_mode}, 持仓方向: net")
+            
+            params = {
+                'marginMode': margin_mode, # 'isolated' or 'cross'
+                'posSide': 'net'           # 关键参数！
+            }
+            
+            # 2. 统一调用 set_leverage
+            response = self.exchange.set_leverage(leverage, symbol, params)
+            
+            print(f"[✓] 成功设置杠杆和保证金模式: {response}")
+            return True
+            
+        except Exception as e:
+            print(f"[ERROR] 设置 {symbol} 杠杆/保证金模式失败: {e}")
+            import traceback
+            print(traceback.format_exc())
+            return False
+    # [!!!] 修复：结束于此
+
 
     # ==================================================================
     # 封装的交易"按钮" (Public Methods)
@@ -336,4 +414,85 @@ class OkxTrader:
             'unrealized_pnl': portfolio['unrealized_pnl'],
             'total_value': total_value,
         }
+    
+# ==================================================================
+# [V2.0 新增] 阶段 6.2 - 合约模式 (SWAP) 测试脚本
+# ==================================================================
+if __name__ == '__main__':
+    """
+    用于独立测试 OkxTrader (v2.0 合约版) 是否配置正确。
+    """
+    print("[V2.0 测试] 正在启动 OkxTrader (合约模式)...")
+    
+    # 1. 从环境变量加载 API 密钥
+    API_KEY = os.environ.get('OKX_API_KEY')
+    SECRET = os.environ.get('OKX_SECRET')
+    PASSPHRASE = os.environ.get('OKX_PASSPHRASE')
+    
+    if not all([API_KEY, SECRET, PASSPHRASE]):
+        print("[ERROR] 请先设置 OKX_API_KEY, OKX_SECRET, 和 OKX_PASSPHRASE 环境变量。")
+        exit()
 
+    try:
+        # 2. 初始化 Trader (会自动切换到 'swap' 模式)
+        trader = OkxTrader(API_KEY, SECRET, PASSPHRASE, is_demo=True)
+        
+        # 3. [测试 6.2a] 检查合约市场
+        print("\n--- [测试 6.2a] 检查合约市场 ---")
+        # 现货是 'BTC/USDT', 永续合约是 'BTC/USDT:USDT'
+        swap_symbol = 'BTC/USDT:USDT'
+        market_found = False
+        if trader.exchange.markets:
+            if swap_symbol in trader.exchange.markets:
+                market_found = True
+                print(f"[✓] 成功找到永续合约市场: {swap_symbol}")
+            else:
+                print(f"[!] 未找到 {swap_symbol}。是否加载了市场？")
+                # 打印一些可用的 SWAP 市场
+                print("  可用 SWAP 市场 (示例):")
+                count = 0
+                for m in trader.exchange.markets:
+                    if m.endswith(':USDT'):
+                        print(f"    - {m}")
+                        count += 1
+                    if count >= 5:
+                        break
+        if not market_found:
+            raise Exception(f"关键测试失败: 未能在市场列表中找到 {swap_symbol}")
+
+        # 4. [测试 6.2b] 获取合约账户余额
+        print("\n--- [测试 6.2b] 获取合约账户余额 ---")
+        # 合约账户的余额通常是 USDT, USDC 等
+        balance = trader.get_balance()
+        if not balance:
+            print("[!] 警告: 未能获取到任何合约账户余额。")
+        else:
+            print(f"[✓] 成功获取余额: {list(balance.keys())}")
+            if 'USDT' in balance:
+                print(f"  > USDT 余额: {balance['USDT']}")
+            else:
+                print("[!] 警告: 合约账户中没有 USDT 余额。")
+        
+        # 5. [测试 6.2c] 获取合约 Ticker
+        print(f"\n--- [测试 6.2c] 获取 {swap_symbol} Ticker ---")
+        ticker = trader.get_ticker(swap_symbol)
+        if ticker and ticker.get('last'):
+            print(f"[✓] 成功获取 Ticker: {swap_symbol} @ ${ticker['last']}")
+        else:
+            raise Exception(f"关键测试失败: 未能获取 {swap_symbol} 的 Ticker")
+
+        # 6. [测试 6.2d] 获取合约 OHLCV
+        print(f"\n--- [测试 6.2d] 获取 {swap_symbol} 1h K线 ---")
+        ohlcv = trader.get_ohlcv(swap_symbol, '1h', 5)
+        if ohlcv and len(ohlcv) == 5:
+            print(f"[✓] 成功获取 {len(ohlcv)} 根 K线。")
+            print(f"  > 最新一根K线 (示例): {ohlcv[-1]}")
+        else:
+            raise Exception(f"关键测试失败: 未能获取 {swap_symbol} 的 K线")
+            
+        print("\n[SUCCESS] V2.0 (合约模式) 基础测试全部通过！")
+
+    except Exception as e:
+        print(f"\n[FAILURE] V2.0 (合约模式) 测试失败: {e}")
+        import traceback
+        print(traceback.format_exc())
