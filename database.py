@@ -30,13 +30,20 @@ class Database:
 
         # Providers table (API提供方)
         cursor.execute('''
-            CREATE TABLE IF NOT EXISTS providers (
+            CREATE TABLE IF NOT EXISTS models (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 name TEXT NOT NULL,
-                api_url TEXT NOT NULL,
-                api_key TEXT NOT NULL,
-                models TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                provider_id INTEGER,
+                model_name TEXT NOT NULL,
+                
+                -- [TechLead 改造 - V3.0] --
+                -- 移除了 'initial_capital'
+                max_leverage REAL DEFAULT 5, -- 重命名了 'default_leverage'
+                tradable_coins TEXT,
+                -- [改造结束] --
+                
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (provider_id) REFERENCES providers(id)
             )
         ''')
 
@@ -136,25 +143,26 @@ class Database:
     
     def upgrade_db_schema(self):
         """
-        [TechLead 新增]
+        [TechLead 改造 - V3.0]
         执行数据库 schema 迁移。
-        例如：移除 settings 表中不再需要的 trading_fee_rate 列。
+        - (不变) 移除 settings.trading_fee_rate
+        - (新) 移除 models.initial_capital
+        - (新) 重命名 models.default_leverage -> max_leverage
         """
         conn = self.get_connection()
         cursor = conn.cursor()
         
+        print("[INFO] DB Schema: 正在检查数据库升级...")
+        
         try:
-            # 检查 'trading_fee_rate' 列是否存在
+            # === 1. 升级 'settings' 表 (不变) ===
             cursor.execute("PRAGMA table_info(settings)")
-            columns = [col['name'] for col in cursor.fetchall()]
+            columns_settings = [col['name'] for col in cursor.fetchall()]
             
-            if 'trading_fee_rate' in columns:
+            if 'trading_fee_rate' in columns_settings:
                 print("[INFO] DB Schema: 正在从 'settings' 表中移除 'trading_fee_rate' 列...")
-                
-                # SQLite 不支持 'DROP COLUMN'，需要“重建”表
+                # ( ... 此处保留所有重建 settings 表的逻辑 ... )
                 cursor.execute('BEGIN TRANSACTION;')
-                
-                # 1. 创建一个没有 'trading_fee_rate' 的新表
                 cursor.execute('''
                     CREATE TABLE IF NOT EXISTS settings_new (
                         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -163,25 +171,74 @@ class Database:
                         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                     )
                 ''')
-                
-                # 2. 从旧表复制数据到新表 (只复制需要的列)
                 cursor.execute('''
                     INSERT INTO settings_new (id, trading_frequency_minutes, created_at, updated_at)
                     SELECT id, trading_frequency_minutes, created_at, updated_at
                     FROM settings
                 ''')
-                
-                # 3. 删除旧表
                 cursor.execute('DROP TABLE settings')
-                
-                # 4. 重命名新表
                 cursor.execute('ALTER TABLE settings_new RENAME TO settings')
-                
                 conn.commit()
                 print("[INFO] DB Schema: 'settings' 表已成功升级。")
+            
+            # =======================================================
+            # [TechLead 改造 - V3.0]
+            # === 2. 升级 'models' 表 ===
+            # =======================================================
+            cursor.execute("PRAGMA table_info(models)")
+            columns_models = [col['name'] for col in cursor.fetchall()]
+
+            # 检查是否需要 V3.0 迁移
+            # (如果 'initial_capital' 或 'default_leverage' 仍然存在)
+            if 'initial_capital' in columns_models or 'default_leverage' in columns_models:
+                print("[INFO] DB Schema: 正在迁移 'models' 表 (V3.0)...")
+                print("  > 移除 'initial_capital'")
+                print("  > 重命名 'default_leverage' -> 'max_leverage'")
                 
+                cursor.execute('BEGIN TRANSACTION;')
+                
+                # 1. 创建 V3.0 "蓝图"
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS models_v3 (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        name TEXT NOT NULL,
+                        provider_id INTEGER,
+                        model_name TEXT NOT NULL,
+                        max_leverage REAL DEFAULT 5,
+                        tradable_coins TEXT,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        FOREIGN KEY (provider_id) REFERENCES providers(id)
+                    )
+                ''')
+                
+                # 2. 迁移数据 (从 V2.0 迁移)
+                # (我们必须处理 'default_leverage' 存在的情况)
+                leverage_col = 'default_leverage' if 'default_leverage' in columns_models else '5.0'
+                coins_col = 'tradable_coins' if 'tradable_coins' in columns_models else "''"
+                
+                cursor.execute(f'''
+                    INSERT INTO models_v3 (id, name, provider_id, model_name, max_leverage, tradable_coins, created_at)
+                    SELECT id, name, provider_id, model_name, {leverage_col}, {coins_col}, created_at
+                    FROM models
+                ''')
+                
+                # 3. 替换旧表
+                cursor.execute('DROP TABLE models')
+                cursor.execute('ALTER TABLE models_v3 RENAME TO models')
+                
+                conn.commit()
+                print("[INFO] DB Schema: 'models' 表已成功升级到 V3.0。")
+            
+            # (V2.0 的备用检查，以防万一)
+            elif 'tradable_coins' not in columns_models:
+                 print("[INFO] DB Schema: (V2备用) 正在向 'models' 表添加 'tradable_coins'...")
+                 cursor.execute("ALTER TABLE models ADD COLUMN tradable_coins TEXT")
+                 print("[INFO] DB Schema: 'tradable_coins' 已添加。")
+            
             else:
-                print("[INFO] DB Schema: 'settings' 表已是最新，无需升级。")
+                print("[INFO] DB Schema: 'models' 表已是 V3.0 (或最新)。")
+
+            print("[INFO] DB Schema: 数据库已是最新。")
 
         except Exception as e:
             print(f"[ERROR] 数据库迁移失败: {e}")
@@ -252,8 +309,13 @@ class Database:
         if current_prices:
             for pos in positions:
                 coin = pos['coin']
-                if coin in current_prices:
-                    current_price = current_prices[coin]
+                
+                # [TechLead 修复 - 解决 TypeError]
+                # current_prices 现在是 {'price': ..., 'change_24h': ...}
+                current_price_data = current_prices.get(coin)
+
+                if current_price_data and current_price_data.get('price', 0) > 0:
+                    current_price = current_price_data['price']
                     entry_price = pos['avg_price']
                     quantity = pos['quantity']
                     
@@ -267,6 +329,7 @@ class Database:
                     pos['pnl'] = pos_pnl
                     unrealized_pnl += pos_pnl
                 else:
+                    # 如果没有获取到价格数据
                     pos['current_price'] = None
                     pos['pnl'] = 0
         
@@ -517,14 +580,13 @@ class Database:
 
     # ============ Model Management (Updated) ============
 
-    def add_model(self, name: str, provider_id: int, model_name: str, initial_capital: float = 10000) -> int:
+    def add_model(self, name: str, provider_id: int, model_name: str, max_leverage: float = 5.0, tradable_coins: str = '') -> int: # <-- [THE FIX]
         """Add new trading model"""
         conn = self.get_connection()
         cursor = conn.cursor()
-        cursor.execute('''
-            INSERT INTO models (name, provider_id, model_name, initial_capital)
-            VALUES (?, ?, ?, ?)
-        ''', (name, provider_id, model_name, initial_capital))
+        cursor.execute(''' INSERT INTO models (name, provider_id, model_name, max_leverage, tradable_coins) 
+                       VALUES (?, ?, ?, ?, ?) 
+        ''', (name, provider_id, model_name, max_leverage, tradable_coins)) # <-- [THE FIX]
         model_id = cursor.lastrowid
         conn.commit()
         conn.close()
@@ -557,3 +619,38 @@ class Database:
         rows = cursor.fetchall()
         conn.close()
         return [dict(row) for row in rows]
+
+    # =======================================================
+    # [TechLead 新增 - 阶段 10-2]
+    # === 3. 更新模型配置 ===
+    # =======================================================
+    def update_model_config(self, model_id: int, name: str, leverage: float, coins: str) -> bool: # <-- [THE FIX]
+        """ 
+        [10-2 V3.0] 更新模型的名称、杠杆和可交易币种。 
+        """
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        try:
+            print(f"[INFO] DB: 正在更新 Model {model_id} 的配置 (V3.0)...")
+            print(f" > 名称: {name}")
+            print(f" > 最大杠杆: {leverage}x")
+            print(f" > 币种: {coins}")
+            
+            cursor.execute('''
+                UPDATE models
+                SET 
+                    name = ?,
+                    max_leverage = ?,
+                    tradable_coins = ?
+                WHERE id = ?
+            ''', (name, leverage, coins, model_id)) # <-- [THE FIX]
+            
+            conn.commit()
+            print("[INFO] DB: 更新成功。")
+            return True
+        except Exception as e:
+            print(f"[ERROR] DB: 更新 Model {model_id} 配置失败: {e}")
+            conn.rollback()
+            return False
+        finally:
+            conn.close()

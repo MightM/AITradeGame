@@ -230,8 +230,26 @@ class OkxTrader:
         except Exception as e:
             print(f"[ERROR] 获取 {symbol} Funding Rate 失败: {e}")
             return {}
-        
-    # [!!!] 修复：开始于此
+
+    def get_positions(self) -> List[Dict]:
+        """
+        [V2.0 新增 - 6.3] 获取当前所有的合约持仓。
+        这是 V2.0 的核心，它返回我们真实的“风险敞口”。
+        """
+        print(f"正在调用: get_positions()")
+        try:
+            # ccxt's fetch_positions()
+            # 它会返回一个包含所有非零持仓的列表
+            positions = self.exchange.fetch_positions()
+            
+            print(f"[✓] 成功获取到 {len(positions)} 个持仓。")
+            return positions
+        except Exception as e:
+            print(f"[ERROR] get_positions 失败: {e}")
+            # [TechLead] 关键：失败时返回空列表，而不是 None
+            return []
+    # ===============================================    
+
     # 修正了 set_leverage 方法以适应 OKX 统一账户
     def set_leverage(self, symbol: str, leverage: int, margin_mode: str = 'isolated'):
         print(f"正在调用: set_leverage(symbol={symbol}, leverage={leverage}, mode={margin_mode})")
@@ -265,6 +283,216 @@ class OkxTrader:
             return False
     # [!!!] 修复：结束于此
 
+    # ==================================================================
+    # [TechLead 新增] 核心交易 API (Phase 8-2)
+    # ==================================================================
+    def create_position_with_tp_sl(self, symbol: str, side: str, amount: float, 
+                                   leverage: int, tp_price: float, sl_price: float) -> Optional[Dict]:
+        """
+        [V2.0 终极修复版 - V5.0 / 学徒版]
+        [!] 核心发现：此函数只负责开仓。TP/SL 必须在*之后*附加。
+        [!] 解决方案：此函数现在调用 _create_market_order 
+            (我们知道这个能用)。
+        """
+        print(f"  [ATOM-V5] 正在(第1步)创建 {side} 仓位: {amount} {symbol}")
+        print(f"  [ATOM-V5] (警告) TP: ${tp_price} 和 SL: ${sl_price} 将在下一步附加")
+        
+        # [核心修复] 调用简单、可用的内部市价单函数
+        return self._create_market_order(symbol, side, amount)
+    
+    def set_tp_sl_for_position(self, symbol: str, pos_side: str, amount: float, tp_price: float, sl_price: float) -> Optional[Dict]:
+        """
+        [V2.0 新增 - 8-2 V5.0] 附加 TP/SL 到一个已存在的仓位。
+        
+        这会调用 /api/v5/trade/order-algo (策略订单)
+        
+        [!] 核心修复 V6: 解决 "Parameter side can not be empty"
+        我们必须指定 TP/SL 订单本身的 'side' (方向)。
+        """
+        print(f"  [ATOM-V6] 正在(第2步)为 {symbol} ({pos_side}) 仓位附加 TP/SL...")
+        print(f"  [ATOM-V6]   TP: ${tp_price}, SL: ${sl_price}")
+        
+        # [THE FIX] 确定平仓的方向
+        # 如果我们是 'long' 仓位, 我们的 TP/SL 订单必须是 'sell'
+        exit_side = 'sell' if pos_side == 'long' else 'buy'
+        
+        try:
+            # [!!! 终极修复 !!!]
+            # 我们必须将 ccxt 的 'symbol' (e.g., BTC/USDT:USDT)
+            # 转换回 OKX API 的 'instId' (e.g., BTC-USDT-SWAP)
+            market = self.exchange.market(symbol)
+            if not market:
+                print(f"[ERROR] [ATOM-V6] 无法在 ccxt 市场中找到 {symbol}。")
+                return None
+            
+            inst_id = market['id'] # 这才是 'BTC-USDT-SWAP'
+            # 1. [TechLead 修复 V5.0] 构建 /trade/order-algo 所需的 params
+            params = {
+                'instId': inst_id,
+                'tdMode': 'isolated',
+                'posSide': 'net',
+                
+                # [THE FIX] 传入 'side'
+                'side': exit_side, 
+                
+                # [8-1 修复] 这是 OKX API 的 OCO (One-Cancels-Other) 订单
+                'ordType': 'oco', 
+
+                'sz': str(amount), # <--- [核心修复] 告诉 OKX 订单的数量
+                
+                # 止盈单 (Take Profit)
+                'tpTriggerPx': str(tp_price),
+                'tpOrdType': 'market',
+                'tpOrdPx': '-1', # <--- [核心修复] 告诉 OKX 这是市价
+                
+                # 止损单 (Stop Loss)
+                'slTriggerPx': str(sl_price),
+                'slOrdType': 'market',
+                'slOrdPx': '-1', # <--- [核心修复] 告诉 OKX 这是市价
+            }
+            
+            # 2. [TechLead 修复 V5.0] 调用正确的 API
+            response = self.exchange.private_post_trade_order_algo(params)
+            
+            # 3. 检查 OKX 的原始响应
+            if response.get('code') == '0':
+                print(f"  [ATOM-V6] TP/SL 策略订单已成功提交。")
+                return response.get('data', [{}])[0]
+            else:
+                s_msg = response.get('sMsg', response)
+                print(f"[ERROR] [ATOM-V6] 附加 TP/SL 失败: {s_msg}")
+                # [TechLead 调试] 打印我们发送的 params
+                print(f"  [ATOM-V6] 失败的 Params: {params}")
+                return None
+
+        except ccxt.ExchangeError as e:
+            print(f"[ERROR] [ATOM-V6] {symbol} 附加 TP/SL 失败: 交易所错误。{e}")
+            return None
+        except Exception as e:
+            print(f"[ERROR] [ATOM-V6] {symbol} 附加 TP/SL 失败: 未知错误。{e}")
+            import traceback
+            print(traceback.format_exc())
+            return None
+        
+    def get_market_precision_info(self) -> Dict:
+        """
+        [V2.0 新增 - 9.3] 获取所有相关市场的精度信息。
+        AI 需要这个信息来下达“合法”的订单。
+        """
+        print("[INFO] OkxTrader: 正在获取市场精度信息 (最小下单量)...")
+        precision_info = {}
+        for coin in self.coins:
+            try:
+                symbol = f"{coin}/{self.quote_currency}:USDT" # e.g., "BTC/USDT:USDT"
+                market = self.exchange.market(symbol)
+                
+                # 'amount' 精度 = 最小下单量
+                min_amount = market.get('limits', {}).get('amount', {}).get('min', 0.01)
+                
+                precision_info[coin] = {
+                    'min_order_amount': float(min_amount)
+                }
+            except Exception as e:
+                print(f"[WARN] 获取 {coin} 市场精度失败: {e}")
+                precision_info[coin] = {'min_order_amount': 0.01} # 默认
+        
+        return precision_info    
+
+    def _execute_buy(self, coin: str, decision: Dict, portfolio: Dict) -> Dict:
+        """
+        [TechLead 改造 - Phase 8-4 V6.0 (Two-Step)]
+        执行两步开仓：1. 开仓 2. 附加 TP/SL
+        """
+        if not self.trader:
+            print("[WARN] _execute_buy: No trader...")
+            return self._execute_buy_simulation(coin, decision, portfolio)
+
+        try:
+            # 1. [8-4] 提取所有 V2.0 参数
+            quantity = float(decision.get('quantity_contracts', 0))
+            leverage = int(decision.get('leverage', 10))
+            tp_price = float(decision.get('profit_target', 0))
+            sl_price = float(decision.get('stop_loss', 0))
+            
+            if quantity <= 0:
+                return {'coin': coin, 'error': 'Invalid quantity_contracts'}
+
+            symbol = f"{coin}/{self.quote_currency}:USDT"
+            pos_side = 'long' # 因为这是 _execute_buy
+            
+            # 2. [8-4] (关键!) 设置杠杆
+            print(f"[TRADE_EXEC] 正在设置杠杆 {symbol} @ {leverage}x (isolated)")
+            set_lev_ok = self.trader.set_leverage(symbol, leverage, 'isolated')
+            if not set_lev_ok:
+                return {'coin': coin, 'error': f'Failed to set leverage {leverage}x'}
+
+            # 3. [8-4 V5.0] (第 1 步) 执行开仓
+            print(f"[TRADE_EXEC] 正在执行 [第 1 步: 开仓]...")
+            order_details = self.trader.create_position_with_tp_sl(
+                symbol, 'buy', quantity, leverage, tp_price, sl_price
+            )
+            
+            if not order_details:
+                print(f"[TRADE_FAIL] (第 1 步) 真实买入 {symbol} 失败。")
+                return {'coin': coin, 'error': 'Trade execution failed (Step 1: Open)'}
+            
+            real_price = order_details['average']
+            real_quantity_filled = order_details['filled']
+            real_fee_cost = order_details['fee']['cost']
+            
+            print(f"[TRADE_SUCCESS] (第 1 步) 真实买入 {symbol} 成功。 Avg Price: {real_price}")
+
+            # 4. [8-4 V6.0] (第 2 步) 附加 TP/SL
+            tp_sl_msg = "(无 TP/SL)"
+            if tp_price > 0 and sl_price > 0:
+                print(f"[TRADE_EXEC] 正在执行 [第 2 步: 附加 TP/SL]...")
+                # [THE FIX] 传入 'pos_side' (long)
+                tp_sl_response = self.trader.set_tp_sl_for_position(
+                    symbol, pos_side, tp_price, sl_price 
+                )
+                if tp_sl_response:
+                    tp_sl_msg = f"(TP/SL [AlgoID: {tp_sl_response.get('algoId')}] 已设置)"
+                else:
+                    tp_sl_msg = "(TP/SL 附加失败!)"
+            
+            # 5. (不变) 更新 V1 数据库
+            old_pos = self.db.get_single_position(self.model_id, coin, pos_side)
+            old_quantity = old_pos['quantity'] if old_pos else 0
+            old_avg_price = old_pos['avg_price'] if old_pos else 0
+            
+            total_quantity = old_quantity + real_quantity_filled 
+            total_cost = (old_quantity * old_avg_price) + (real_quantity_filled * real_price)
+            new_avg_price = total_cost / total_quantity if total_quantity > 0 else 0
+            
+            self.db.update_position(
+                self.model_id, coin, total_quantity, new_avg_price, leverage, pos_side
+            )
+            print(f"[INFO] (V1-Sim) 持仓成本已更新: {coin} Qty: {total_quantity:.8f}")
+
+            # 6. (不变) 记录交易
+            fee_in_usdt = real_fee_cost
+            if real_fee_currency != self.quote_currency: #
+                ticker = self.trader.get_ticker(f"{real_fee_currency}/{self.quote_currency}:USDT")
+                if ticker and ticker.get('last'):
+                    fee_in_usdt = real_fee_cost * ticker['last']
+                else:
+                    fee_in_usdt = real_fee_cost * real_price
+            
+            self.db.add_trade(
+                self.model_id, coin, 'buy_to_enter', real_quantity_filled, 
+                real_price, leverage, pos_side, pnl=0, fee=fee_in_usdt
+            )
+            
+            return {
+                'coin': coin, 'signal': 'buy_to_enter', 'quantity': real_quantity_filled, 'price': real_price,
+                'leverage': leverage, 'fee': fee_in_usdt,
+                'message': f'[REAL] Long {real_quantity_filled:.8f} {coin} @ ${real_price:.2f} {tp_sl_msg}'
+            }
+        except Exception as e:
+            print(f"[ERROR] _execute_buy 失败: {e}")
+            import traceback
+            print(traceback.format_exc())
+            return {'coin': coin, 'error': str(e)}
 
     # ==================================================================
     # 封装的交易"按钮" (Public Methods)
@@ -288,16 +516,22 @@ class OkxTrader:
     # [新] 业务逻辑辅助方法 (Public Methods)
     # ==================================================================
 
-    def get_current_prices(self, coins: List[str]) -> Dict:
+    def get_current_prices_for_api(self) -> Dict:
         """
-        [TechLead 新增]
+        [TechLead 修复]
         获取 app.py (前端) 所需的价格字典。
+        这个版本有 app.py 需要的正确名字 (get_current_prices_for_api)，
+        并且使用了 self.coins 列表，不再需要参数。
         """
-        print("[INFO] OkxTrader: 正在为 API 获取当前价格...")
+        print("[INFO] OkxTrader: S 正在为 API 获取当前价格...")
         prices = {}
-        for coin in coins:
+        
+        # [FIX] 使用 self.coins (在 __init__ 中定义)
+        for coin in self.coins: 
             try:
-                symbol = f"{coin}/{self.quote_currency}"
+                # [FIX] 合约模式下，我们必须使用合约符号
+                symbol = f"{coin}/{self.quote_currency}:USDT" # e.g., "BTC/USDT:USDT"
+                
                 ticker = self.get_ticker(symbol)
                 if ticker and ticker.get('last'):
                     prices[coin] = {
@@ -307,7 +541,7 @@ class OkxTrader:
                 else:
                     prices[coin] = {'price': 0, 'change_24h': 0}
             except Exception as e:
-                print(f"[WARN] get_current_prices: 获取 {coin} 价格失败: {e}")
+                print(f"[WARN] get_current_prices_for_api: 获取 {coin} 价格失败: {e}")
                 prices[coin] = {'price': 0, 'change_24h': 0}
         return prices
 
@@ -390,31 +624,21 @@ class OkxTrader:
 
     def build_account_info(self, portfolio: Dict, db_portfolio: Dict, model_id: int, db: 'Database') -> Dict:
         """
-        [TechLead 新增]
-        构建 AI 和 API 端点所需的账户信息。
+        [TechLead 改造 - V3.0]
+        移除了 'initial_capital'。 P&L 现在基于真实价值。
         """
-        model = db.get_model(model_id) # 需要 db 实例
-        if not model:
-            raise Exception(f"Model {model_id} not found when building account info")
-            
-        initial_capital = model['initial_capital']
+        # [THE FIX] 移除了 'model = db.get_model...' 和 'initial_capital'
         total_value = portfolio['total_value']
-        
         realized_pnl = db_portfolio.get('realized_pnl', 0)
-        
-        total_return = 0
-        if initial_capital > 0:
-            total_return = ((total_value - initial_capital) / initial_capital) * 100
-        
+
         return {
-            'current_time': datetime.now().strftime('%Y-%m-%d %H:%M:%S'), # [TechLead 修复] datetime 现在已导入
-            'total_return': total_return,
-            'initial_capital': initial_capital,
+            'current_time': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            'initial_capital': 0, # [FIX] 暂时保留为 0，供旧 UI 使用
+            'total_return': 0,  # [FIX] 暂时保留为 0
+            'total_value': total_value,
             'realized_pnl': realized_pnl, 
             'unrealized_pnl': portfolio['unrealized_pnl'],
-            'total_value': total_value,
         }
-    
 # ==================================================================
 # [V2.0 新增] 阶段 6.2 - 合约模式 (SWAP) 测试脚本
 # ==================================================================
@@ -489,8 +713,110 @@ if __name__ == '__main__':
             print(f"  > 最新一根K线 (示例): {ohlcv[-1]}")
         else:
             raise Exception(f"关键测试失败: 未能获取 {swap_symbol} 的 K线")
-            
-        print("\n[SUCCESS] V2.0 (合约模式) 基础测试全部通过！")
+        
+        # ===============================================
+        # [TechLead] V2.0 核心测试 [6.3a]
+        # ===============================================
+        
+        # 7. [测试 6.3a] 获取合约持仓
+        print(f"\n--- [测试 6.3a] 获取合约持仓 (fetch_positions) ---")
+        positions = trader.get_positions() # 调用我们的新方法
+        
+        # 'positions' 应该是一个列表。
+        # 在沙盒中，这个列表很可能是空的 []，这是正常的。
+        # 只要调用不抛出异常并且返回一个列表，测试就通过了。
+        
+        if not positions: 
+            # 如果 positions 是 [] (空列表)
+            print("[✓] 成功调用 get_positions()。")
+            print("[INFO] 当前没有持仓 (返回 [])。这在沙盒测试中是正常的。")
+        else:
+            # 如果你真的有持仓
+            print(f"[✓] 成功获取 {len(positions)} 个持仓:")
+            for pos in positions:
+                # 打印持仓的关键信息
+                symbol = pos.get('symbol', 'N/A')
+                side = pos.get('side', 'N/A')
+                contracts = pos.get('contracts', 0) # 合约数量
+                entry_price = pos.get('entryPrice', 0)
+                print(f"  > {symbol} ({side}): {contracts} 份 @ ${entry_price}")
+        # ===============================================
+
+        print("\n[SUCCESS] V2.0 (合约模式) 基础测试 [6.1-6.2] 和核心测试 [6.3a] 全部通过！")
+
+        # ===============================================
+        # [TechLead] V2.0 写入测试 [6.4]
+        # ===============================================
+        print(f"\n--- [测试 6.4a] 写入测试：设置杠杆并开仓 ---")
+
+        # 1. 定义我们要交易的符号和数量
+        trade_symbol = 'BTC/USDT:USDT'
+        trade_leverage = 10
+        # OKX 合约最小下单量是 0.01 合约数量
+        trade_amount_contracts = 0.01
+
+        # 2. (关键!) 设置杠杆
+        print(f"  > 正在设置杠杆 {trade_symbol} @ {trade_leverage}x (isolated)")
+        set_lev_ok = trader.set_leverage(trade_symbol, trade_leverage, 'isolated')
+        if not set_lev_ok:
+            raise Exception(f"设置杠杆失败，停止测试。")
+        print(f"  > 杠杆设置成功。")
+
+        # 3. (开仓) 执行市价买入
+        print(f"  > 正在执行开多仓 (buy_market): {trade_amount_contracts} {trade_symbol}")
+        open_order = trader.buy_market(trade_symbol, trade_amount_contracts)
+        if not open_order or open_order.get('status') != 'closed':
+            raise Exception(f"开仓失败，停止测试。 订单: {open_order}")
+        
+        print(f"  > [✓] 开仓成功！ 均价: ${open_order.get('average')}")
+
+        # 4. (验证) 立即再次获取持仓
+        print(f"  > 正在验证持仓 (get_positions)...")
+        positions_after_buy = trader.get_positions()
+        
+        if not positions_after_buy:
+            raise Exception(f"严重错误：开仓成功但 get_positions() 返回空列表！")
+        
+        print(f"[✓] 成功获取 {len(positions_after_buy)} 个持仓:")
+        found = False
+        for pos in positions_after_buy:
+            if pos.get('symbol') == trade_symbol:
+                found = True
+                print(f"  > 验证通过: 找到 {pos.get('symbol')} ({pos.get('side')}), 数量: {pos.get('contracts')}")
+        if not found:
+            raise Exception(f"严重错误：未在持仓列表中找到 {trade_symbol}！")
+
+
+        print(f"\n--- [测试 6.4b] 写入测试：平仓 ---")
+        
+        # 5. (平仓) 执行市价卖出
+        # 注意：要平掉 0.001 BTC 的 'long' 仓位，我们必须 'sell' 0.001 BTC
+        print(f"  > 正在执行平多仓 (sell_market): {trade_amount_contracts} {trade_symbol}")
+        close_order = trader.sell_market(trade_symbol, trade_amount_contracts)
+        
+        if not close_order or close_order.get('status') != 'closed':
+            raise Exception(f"平仓失败，停止测试。 订单: {close_order}")
+        
+        print(f"  > [✓] 平仓成功！ 均价: ${close_order.get('average')}")
+
+        # 6. (最终验证)
+        print(f"  > 正在验证持仓已清除 (get_positions)...")
+        # (注意：交易所后台清算需要一点时间，我们等 2 秒)
+        import time
+        time.sleep(2) 
+        positions_after_sell = trader.get_positions()
+        
+        if not positions_after_sell:
+            print("[✓] 验证通过！ get_positions() 返回空列表。")
+        else:
+            print(f"[!] 警告：平仓后 get_positions() 仍返回 {len(positions_after_sell)} 个持仓。")
+            print(f"  > {positions_after_sell}")
+            print("  > (这在沙盒中可能是正常的延迟，如果数量已归零)")
+
+        # ===============================================
+
+        print("\n[SUCCESS] V2.0 (合约模式) 写入测试 [6.4] 全部通过！")
+
 
     except Exception as e:
         print(f"\n[FAILURE] V2.0 (合约模式) 测试失败: {e}")

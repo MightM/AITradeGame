@@ -844,6 +844,14 @@ class TradingApp {
         const displayName = document.getElementById('modelName').value.trim();
         const initialCapital = parseFloat(document.getElementById('initialCapital').value);
 
+        // [TechLead 新增 - 阶段 10-3]
+        // 1. 从新的 HTML 输入框中读取值
+        const leverage = parseFloat(document.getElementById('modelLeverage').value);
+        const coinsStr = document.getElementById('modelCoins').value.trim();
+        
+        // 2. 将币种字符串转换为数组
+        const coinsList = coinsStr ? coinsStr.split(',').map(c => c.trim().toUpperCase()) : [];
+
         if (!providerId || !modelName || !displayName) {
             alert('请填写所有必填字段');
             return;
@@ -857,7 +865,12 @@ class TradingApp {
                     provider_id: providerId,
                     model_name: modelName,
                     name: displayName,
-                    initial_capital: initialCapital
+                    initial_capital: initialCapital,
+                    
+                    // [TechLead 新增 - 阶段 10-3]
+                    // 3. 将新配置发送到我们的 V2.0 后端
+                    default_leverage: leverage,
+                    tradable_coins: coinsList 
                 })
             });
 
@@ -898,6 +911,9 @@ class TradingApp {
         document.getElementById('modelIdentifier').value = '';
         document.getElementById('modelName').value = '';
         document.getElementById('initialCapital').value = '100000';
+        // [TechLead 新增 - 阶段 10-3]
+        document.getElementById('modelLeverage').value = '5';
+        document.getElementById('modelCoins').value = '';
     }
 
     async refresh() {

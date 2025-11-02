@@ -57,6 +57,12 @@ except Exception as e:
     okx_trader = None
 # --- 结束 V2.0 全局对象 ---
 
+# [TechLead 修复 - Phase 9.2 (Rate Limit)]
+# 我们必须缓存 market_state，以防止 app.py 和 trading_engine.py
+# 都在请求 API，导致“Too Many Requests”
+market_data_cache = {}
+# --- 结束 V2.0 全局对象 ---
+
 
 @app.route('/')
 def index():
@@ -136,6 +142,7 @@ def get_models():
     return jsonify(models)
 
 @app.route('/api/models', methods=['POST'])
+@app.route('/api/models', methods=['POST'])
 def add_model():
     data = request.json
     try:
@@ -143,32 +150,24 @@ def add_model():
         if not provider:
             return jsonify({'error': 'Provider not found'}), 404
 
+        # [TechLead 改造 - V3.0]
+        leverage = float(data.get('max_leverage', 5.0)) # [THE FIX]
+        coins_list = data.get('tradable_coins', [])
+        coins_str = ",".join(coins_list).upper() 
+
         model_id = db.add_model(
             name=data['name'],
             provider_id=data['provider_id'],
             model_name=data['model_name'],
-            initial_capital=float(data.get('initial_capital', 100000))
+            # 'initial_capital' 已被移除
+            max_leverage=leverage,    # <-- [THE FIX]
+            tradable_coins=coins_str
         )
 
-        model = db.get_model(model_id)
-        
-        # [V2.0 改造] 注入 okx_trader
-        trading_engines[model_id] = TradingEngine(
-            model_id=model_id,
-            db=db,
-            market_fetcher=None, # [V2.0] 禁用
-            ai_trader=AITrader(
-                api_key=model['api_key'],
-                api_url=model['api_url'],
-                model_name=model['model_name']
-            ),
-            trade_fee_rate=TRADE_FEE_RATE,
-            okx_trader=okx_trader # [V2.0] 注入！
-        )
+        _initialize_single_engine(model_id)
+
         print(f"[INFO] Model {model_id} ({data['name']}) initialized")
-
         return jsonify({'id': model_id, 'message': 'Model added successfully'})
-
     except Exception as e:
         print(f"[ERROR] Failed to add model: {e}")
         return jsonify({'error': str(e)}), 500
@@ -191,17 +190,14 @@ def delete_model(model_id):
 
 @app.route('/api/models/<int:model_id>/portfolio', methods=['GET'])
 def get_portfolio(model_id):
-    """
-    [V2.0 改造]
-    获取单个模型的详细持仓视图。
-    数据源现在是 okx_trader (真实余额) + db (成本) 的混合体。
-    """
+    """ [V2.0 改造] [FIX 9.2] 现在从 market_data_cache 读取市场状态，不再调用 API。 """
     if not okx_trader:
         return jsonify({'error': 'OkxTrader is not initialized'}), 500
-        
+    if not market_data_cache: 
+        return jsonify({'error': 'Market data is not yet cached. Try again in a moment.'}), 503
     try:
-        # 1. [真实] 从 OKX 获取市场状态 (用于计算 P&L)
-        market_state = okx_trader.get_current_prices_for_api()
+        # 1. [FIX 9.2] 从缓存获取市场状态
+        market_state = market_data_cache
         
         # 2. [真实] 从 OKX 获取账户余额 (数量真相)
         real_balance = okx_trader.get_balance()
@@ -257,17 +253,14 @@ def get_conversations(model_id):
 
 @app.route('/api/aggregated/portfolio', methods=['GET'])
 def get_aggregated_portfolio():
-    """
-    [V2.0 改造]
-    汇总所有模型的资产与持仓。
-    数据源现在是 okx_trader (真实余额) + db (成本)。
-    """
+    """ [V2.0 改造] [FIX 9.2] 现在从 market_data_cache 读取市场状态，不再调用 API。 """ 
     if not okx_trader:
         return jsonify({'error': 'OkxTrader is not initialized'}), 500
-        
+    if not market_data_cache: 
+        return jsonify({'error': 'Market data is not yet cached. Try again in a moment.'}), 503
     try:
-        # 1. [真实] 获取价格
-        market_state = okx_trader.get_current_prices_for_api()
+        # 1. [FIX 9.2] 从缓存获取市场状态
+        market_state = market_data_cache
         
         # 2. [真实] 获取余额
         real_balance = okx_trader.get_balance()
@@ -318,16 +311,13 @@ def get_models_chart_data():
 
 @app.route('/api/market/prices', methods=['GET'])
 def get_market_prices():
-    """
-    [V2.0 改造]
-    从 okx_trader (真实) 获取价格，而不是 market_fetcher (模拟)。
-    """
-    if not okx_trader:
-        return jsonify({'error': 'OkxTrader is not initialized'}), 500
+    """ [V2.0 改造] [FIX 9.2] 现在从 market_data_cache 读取市场状态，不再调用 API。 """
+    if not market_data_cache: 
+        return jsonify({'error': 'Market data is not yet cached. Try again in a moment.'}), 503
         
     try:
-        prices = okx_trader.get_current_prices_for_api()
-        return jsonify(prices)
+        # [FIX 9.2] 直接返回缓存
+        return jsonify(market_data_cache)
     except Exception as e:
         print(f"[ERROR] /api/market/prices failed: {e}")
         return jsonify({'error': str(e)}), 500
@@ -434,17 +424,17 @@ def trading_loop():
 
 @app.route('/api/leaderboard', methods=['GET'])
 def get_leaderboard():
-    """
-    [V2.0 改造]
-    排行榜现在也使用“混合模式”来获取真实的账户价值。
-    """
+    """ [V2.0 改造] [FIX 9.2] 现在从 market_data_cache 读取市场状态，不再调用 API。 """
     if not okx_trader:
         return jsonify({'error': 'OkxTrader is not initialized'}), 500
+    if not market_data_cache: 
+        return jsonify({'error': 'Market data is not yet cached. Try again in a moment.'}), 503
         
     leaderboard = []
     
     try:
-        market_state = okx_trader.get_current_prices_for_api()
+        # [FIX 9.2] 从缓存获取市场状态
+        market_state = market_data_cache
         real_balance = okx_trader.get_balance()
         models = db.get_all_models()
 
@@ -480,6 +470,51 @@ def get_leaderboard():
         
     except Exception as e:
         print(f"[ERROR] /api/leaderboard failed: {e}")
+        import traceback
+        print(traceback.format_exc())
+        return jsonify({'error': str(e)}), 500
+    
+# =======================================================
+# [TechLead 新增 - 阶段 10-2]
+# === 新的 API 路由，用于更新模型配置 ===
+# =======================================================
+@app.route('/api/models/<int:model_id>/config', methods=['PUT'])
+def update_model_config(model_id):
+    """
+    [TechLead 改造 - V3.0]
+    现在更新 name, max_leverage, 和 tradable_coins。
+    """
+    try:
+        data = request.json
+
+        model_data = db.get_model(model_id)
+        if not model_data:
+            return jsonify({'error': '模型未找到。'}), 404
+
+        # 1. 更新名称 (如果提供了)
+        name = data.get('name', model_data.get('name'))
+        # 2. 更新杠杆
+        leverage = float(data.get('max_leverage', model_data.get('max_leverage', 5.0)))
+        # 3. 更新币种
+        coins_list = data.get('tradable_coins', model_data.get('tradable_coins', '').split(','))
+        if isinstance(coins_list, list):
+            coins_str = ",".join(coins_list).upper()
+        else:
+            coins_str = coins_list.upper() 
+
+        success = db.update_model_config(model_id, name, leverage, coins_str)
+
+        if success:
+            if model_id in trading_engines:
+                print(f"[INFO] API: 正在重启 Trading Engine {model_id} 以应用新配置...")
+                del trading_engines[model_id]
+                _initialize_single_engine(model_id)
+
+            return jsonify({'success': True, 'message': '模型配置已更新并已热重载。'})
+        else:
+            return jsonify({'success': False, 'error': '数据库更新失败。'}), 500
+    except Exception as e:
+        print(f"[ERROR] /api/models/{model_id}/config 失败: {e}")
         import traceback
         print(traceback.format_exc())
         return jsonify({'error': str(e)}), 500
@@ -582,10 +617,55 @@ def compare_versions(version1, version2):
     elif v1_parts < v2_parts: return -1
     else: return 0
 
+# =======================================================
+# [TechLead 新增 - 阶段 10-2]
+# === 辅助函数，用于热重载引擎 ===
+# =======================================================
+def _initialize_single_engine(model_id: int):
+    """
+    (辅助函数) 初始化或重新初始化单个 trading engine。
+    """
+    global trading_engines
+    if not okx_trader:
+        print(f"[ERROR] (Re-Init) Model {model_id}: OkxTrader 未初始化。")
+        return False
+        
+    try:
+        model = db.get_model(model_id) #
+        if not model:
+            print(f"[ERROR] (Re-Init) Model {model_id}: 在 DB 中未找到。")
+            return False
+        
+        provider = db.get_provider(model['provider_id']) #
+        if not provider:
+            print(f"[ERROR] (Re-Init) Model {model_id}: Provider 未找到。")
+            return False
+
+        trading_engines[model_id] = TradingEngine(
+            model_id=model_id,
+            db=db,
+            market_fetcher=None, 
+            ai_trader=AITrader(
+                api_key=provider['api_key'],
+                api_url=provider['api_url'],
+                model_name=model['model_name']
+            ),
+            trade_fee_rate=TRADE_FEE_RATE,
+            okx_trader=okx_trader, 
+            market_cache=market_data_cache 
+        )
+        print(f"[INFO] (Re-Init) Model {model_id} ({model['name']}) 已成功初始化/重载。")
+        return True
+    except Exception as e:
+        print(f"[ERROR] (Re-Init) Model {model_id} 初始化失败: {e}")
+        return False
+# =======================================================
+
 def init_trading_engines():
     # 程序启动时：为 DB 中已有的模型创建 TradingEngine
+    # [TechLead 改造 - 10-2] 重构为使用 _initialize_single_engine
     try:
-        models = db.get_all_models()
+        models = db.get_all_models() #
         if not models:
             print("[WARN] No trading models found in database.")
             return
@@ -595,33 +675,12 @@ def init_trading_engines():
             return
 
         print(f"\n[INIT] Initializing trading engines...")
+        initialized_count = 0
         for model in models:
-            model_id = model['id']
-            model_name = model['name']
-            try:
-                provider = db.get_provider(model['provider_id'])
-                if not provider:
-                    print(f"  [WARN] Model {model_id} ({model_name}): Provider not found")
-                    continue
-
-                # [V2.0 改造] 注入 okx_trader
-                trading_engines[model_id] = TradingEngine(
-                    model_id=model_id,
-                    db=db,
-                    market_fetcher=None, # [V2.0] 禁用
-                    ai_trader=AITrader(
-                        api_key=provider['api_key'],
-                        api_url=provider['api_url'],
-                        model_name=model['model_name']
-                    ),
-                    trade_fee_rate=TRADE_FEE_RATE,
-                    okx_trader=okx_trader # [V2.0] 注入！
-                )
-                print(f"  [OK] Model {model_id} ({model_name})")
-            except Exception as e:
-                print(f"  [ERROR] Model {model_id} ({model_name}): {e}")
-                continue
-        print(f"[INFO] Initialized {len(trading_engines)} engine(s)\n")
+            if _initialize_single_engine(model['id']):
+                initialized_count += 1
+        
+        print(f"[INFO] Initialized {initialized_count} engine(s)\n")
     except Exception as e:
         print(f"[ERROR] Init engines failed: {e}\n")
 
@@ -640,6 +699,12 @@ if __name__ == '__main__':
         
     print("[INFO] Initializing database...")
     db.init_db()
+    # =======================================================
+    # [TechLead 新增 - 阶段 10-1]
+    # 在初始化 DB 后，立即执行升级迁移
+    # =======================================================
+    db.upgrade_db_schema() 
+    # =======================================================
     print("[INFO] Database initialized")
     print("[INFO] Initializing trading engines...")
     
